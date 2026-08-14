@@ -2341,7 +2341,7 @@ class CiArtifactActionTests(unittest.TestCase):
         }
         expected_jobs = {
             "ci-quality-slice.yml": {
-                "runner_policy", "quality_contracts", "rust_fmt", "rust_clippy", "cli_docs_sync",
+                "runner_policy", "quality_contracts", "rust_fmt", "rust_clippy", "cli_docs_sync", "authority_sentinel",
             },
             "ci-web-slice.yml": {"runner_policy", "ui_quality", "website"},
             "ci-ui-artifact-slice.yml": {"runner_policy", "ui_artifact"},
@@ -2478,6 +2478,30 @@ class CiArtifactActionTests(unittest.TestCase):
             warmer.count('allow-native-github-cache: "true"'),
             2,
         )
+
+    def test_authority_sentinel_is_explicit_cache_gate_exemption(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "ci-quality-slice.yml"
+        ).read_text(encoding="utf-8")
+        jobs = workflow.split("\njobs:\n", maxsplit=1)[1]
+        match = re.search(
+            r"^  authority_sentinel:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            jobs,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        sentinel = match.group("body")
+        self.assertIn(
+            "# Explicit diagnostic exception: this no-checkout job attests the",
+            workflow,
+        )
+        self.assertIn("authority_sentinel", jobs)
+        self.assertIn("Attest provider-injected cache backend", sentinel)
+        self.assertIn("actions/cache/restore@", sentinel)
+        self.assertIn("actions/cache/save@", sentinel)
+        self.assertNotIn("allow_native_github_cache", sentinel)
+        self.assertNotIn("allow_depot_remote_cache", sentinel)
+        self.assertNotIn("audit-depot-pr-isolation@", sentinel)
 
     def test_depot_sccache_consumers_receive_both_central_cache_outputs(self) -> None:
         provider_workflows = (
