@@ -7553,6 +7553,7 @@ dependencies = [
  "skippy-protocol",
  "skippy-runtime",
  "skippy-tokenizer",
+ "skippy-topology",
  "socket2",
  "tempfile",
  "tokio",
