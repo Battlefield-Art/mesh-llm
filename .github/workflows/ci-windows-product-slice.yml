@@ -77,7 +77,7 @@ jobs:
       matrix:
         runtime: ${{ fromJson(inputs.runtime_matrix) }}
     steps:
-      - uses: Mesh-LLM/mesh-llm/.github/actions/audit-depot-pr-isolation@7df7e6fafa6c87ad0fac7d46dcb7c9ce5d64b01a
+      - uses: Mesh-LLM/mesh-llm/.github/actions/audit-depot-pr-isolation@88be2089e9c900f9149db44c4c72a11f657a2a93
         with:
           original_event_name: ${{ inputs.original_event_name }}
           depot_selected: ${{ startsWith(needs.runner_policy.outputs.runner_windows, 'depot-') }}
