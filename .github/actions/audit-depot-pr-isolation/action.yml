@@ -152,15 +152,27 @@ runs:
           fi
         done
 
-        docker_auth_config="${DOCKER_AUTH_CONFIG:-}"
-        if [[ -n "$docker_auth_config" ]]; then
-          echo "PR runner has Docker registry authentication configured (DOCKER_AUTH_CONFIG)" >&2
-          exit 1
-        fi
-
         docker_config="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"
-        if [[ -f "$docker_config" ]] &&
-           grep -Eiq '"(auths|credHelpers|credsStore)"[[:space:]]*:' "$docker_config"; then
-          echo "PR runner has Docker registry authentication configured (config.json)" >&2
-          exit 1
+        docker_auth_config="${DOCKER_AUTH_CONFIG:-}"
+        if [[ "$depot_selected" == "true" ]]; then
+          if [[ -n "$docker_auth_config" ]]; then
+            echo "PR runner has Docker registry authentication configured (DOCKER_AUTH_CONFIG)" >&2
+            exit 1
+          fi
+          if [[ -f "$docker_config" ]] &&
+             grep -Eiq '"(auths|credHelpers|credsStore)"[[:space:]]*:' "$docker_config"; then
+            echo "PR runner has Docker registry authentication configured (config.json)" >&2
+            exit 1
+          fi
+        else
+          if [[ -n "$docker_auth_config" ]] &&
+             printf '%s' "$docker_auth_config" | grep -Eiq 'depot[.]dev'; then
+            echo "Hosted PR runner has Depot Docker registry authentication configured (DOCKER_AUTH_CONFIG)" >&2
+            exit 1
+          fi
+          if [[ -f "$docker_config" ]] &&
+             grep -Eiq 'depot[.]dev' "$docker_config"; then
+            echo "Hosted PR runner has Depot Docker registry authentication configured (config.json)" >&2
+            exit 1
+          fi
         fi

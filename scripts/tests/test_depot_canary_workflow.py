@@ -105,6 +105,8 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
         self.assertIn("URL userinfo", action)
         self.assertIn('docker_config="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"', action)
         self.assertIn('grep -Eiq \'"(auths|credHelpers|credsStore)"', action)
+        self.assertIn('if [[ "$depot_selected" == "true" ]]; then', action)
+        self.assertIn("grep -Eiq 'depot[.]dev'", action)
 
     def test_pr_audit_receives_central_runner_provider_selection(self) -> None:
         workflow_root = ROOT / ".github" / "workflows"
@@ -374,6 +376,39 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
                     docker_config_content=safe_config,
                 )
                 self.assertNotEqual(result.returncode, 0)
+            if script_name == "audit action":
+                with self.subTest(script=script_name, provider="hosted", auth="DOCKER_AUTH_CONFIG"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=safe_config,
+                        depot_selected="false",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                with self.subTest(script=script_name, provider="hosted", auth="config.json"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=safe_config,
+                        depot_selected="false",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                with self.subTest(script=script_name, provider="hosted", auth="DOCKER_AUTH_CONFIG depot.dev"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=depot_auth,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                with self.subTest(script=script_name, provider="hosted", auth="config.json depot.dev"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=depot_config,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
             with self.subTest(script=script_name, auth="unset"):
                 result = run_probe(script, *valid_endpoints[0])
                 self.assertEqual(result.returncode, 0, result.stderr)
