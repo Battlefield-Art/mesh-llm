@@ -104,7 +104,12 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
         self.assertIn("allow_depot_remote_cache", action)
         self.assertIn("URL userinfo", action)
         self.assertIn('docker_config="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"', action)
-        self.assertIn('grep -Eiq \'"(auths|credHelpers|credsStore)"', action)
+        self.assertIn('python_bin=""', action)
+        self.assertIn('json.loads(raw, parse_constant=reject_constant)', action)
+        self.assertIn('casefold()', action)
+        self.assertIn('"auths", "credHelpers"', action)
+        self.assertIn("Docker auth JSON is malformed", action)
+        self.assertIn('depot_selected == "true"', action)
 
     def test_pr_audit_receives_central_runner_provider_selection(self) -> None:
         workflow_root = ROOT / ".github" / "workflows"
@@ -348,7 +353,10 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
 
         depot_auth = '{"auths":{"REGISTRY.DEPOT.DEV":{"auth":"secret"}}}'
         depot_config = '{"auths":{"registry.depot.dev":{"auth":"secret"}}}'
+        escaped_depot_auth = r'{"auths":{"registry\u002eDEPOT\u002eDEV":{"auth":"secret"}}}'
+        escaped_depot_helpers = r'{"credHelpers":{"REGISTRY\u002eDEPOT\u002eDEV":"secret"}}'
         safe_config = '{"auths":{"ghcr.io":{"auth":"secret"}}}'
+        malformed_config = '{"auths":'
         for script_name, script in (
             ("audit action", action_script),
             ("Depot canary", canary_script),
@@ -367,6 +375,21 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
                     docker_config_content=depot_config,
                 )
                 self.assertNotEqual(result.returncode, 0)
+            for escaped_auth in (escaped_depot_auth, escaped_depot_helpers):
+                with self.subTest(script=script_name, auth="escaped DOCKER_AUTH_CONFIG"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=escaped_auth,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                with self.subTest(script=script_name, auth="escaped config.json"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=escaped_auth,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
             with self.subTest(script=script_name, auth="any config.json"):
                 result = run_probe(
                     script,
@@ -374,6 +397,88 @@ class DepotCanaryWorkflowTests(unittest.TestCase):
                     docker_config_content=safe_config,
                 )
                 self.assertNotEqual(result.returncode, 0)
+            with self.subTest(script=script_name, auth="malformed DOCKER_AUTH_CONFIG"):
+                result = run_probe(
+                    script,
+                    *valid_endpoints[0],
+                    docker_auth_config=malformed_config,
+                    depot_selected="false" if script_name == "audit action" else "true",
+                )
+                self.assertNotEqual(result.returncode, 0)
+            with self.subTest(script=script_name, auth="malformed config.json"):
+                result = run_probe(
+                    script,
+                    *valid_endpoints[0],
+                    docker_config_content=malformed_config,
+                    depot_selected="false" if script_name == "audit action" else "true",
+                )
+                self.assertNotEqual(result.returncode, 0)
+            if script_name == "audit action":
+                with self.subTest(script=script_name, provider="hosted", auth="DOCKER_AUTH_CONFIG"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=safe_config,
+                        depot_selected="false",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                with self.subTest(script=script_name, provider="hosted", auth="config.json"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=safe_config,
+                        depot_selected="false",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                with self.subTest(script=script_name, provider="hosted", auth="DOCKER_AUTH_CONFIG depot.dev"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=depot_auth,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                with self.subTest(script=script_name, provider="hosted", auth="config.json depot.dev"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=depot_config,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                for escaped_auth in (escaped_depot_auth, escaped_depot_helpers):
+                    with self.subTest(script=script_name, provider="hosted", auth="escaped DOCKER_AUTH_CONFIG"):
+                        result = run_probe(
+                            script,
+                            *valid_endpoints[0],
+                            docker_auth_config=escaped_auth,
+                            depot_selected="false",
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                    with self.subTest(script=script_name, provider="hosted", auth="escaped config.json"):
+                        result = run_probe(
+                            script,
+                            *valid_endpoints[0],
+                            docker_config_content=escaped_auth,
+                            depot_selected="false",
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                with self.subTest(script=script_name, provider="hosted", auth="malformed DOCKER_AUTH_CONFIG"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_auth_config=malformed_config,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                with self.subTest(script=script_name, provider="hosted", auth="malformed config.json"):
+                    result = run_probe(
+                        script,
+                        *valid_endpoints[0],
+                        docker_config_content=malformed_config,
+                        depot_selected="false",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
             with self.subTest(script=script_name, auth="unset"):
                 result = run_probe(script, *valid_endpoints[0])
                 self.assertEqual(result.returncode, 0, result.stderr)

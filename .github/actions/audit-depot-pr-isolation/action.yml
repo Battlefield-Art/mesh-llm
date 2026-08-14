@@ -152,15 +152,94 @@ runs:
           fi
         done
 
-        docker_auth_config="${DOCKER_AUTH_CONFIG:-}"
-        if [[ -n "$docker_auth_config" ]]; then
-          echo "PR runner has Docker registry authentication configured (DOCKER_AUTH_CONFIG)" >&2
+        # Docker configuration is parsed with the runner's Python 3 standard
+        # library.  The audit runs before checkout/setup steps, so do not rely
+        # on a repository virtualenv or a package installed by the job.  The
+        # hosted GitHub images and the pinned Depot runner image both provide
+        # python3/python; an unexpected image without either fails closed.
+        python_bin=""
+        for candidate in python3 python; do
+          if command -v "$candidate" >/dev/null 2>&1; then
+            python_bin="$(command -v "$candidate")"
+            break
+          fi
+        done
+        if [[ -z "$python_bin" ]]; then
+          echo "Docker auth JSON audit requires Python 3 on the runner (runtime)" >&2
           exit 1
         fi
-
+        if ! "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1; then
+          echo "Docker auth JSON audit requires Python 3.6 or newer (runtime)" >&2
+          exit 1
+        fi
         docker_config="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"
-        if [[ -f "$docker_config" ]] &&
-           grep -Eiq '"(auths|credHelpers|credsStore)"[[:space:]]*:' "$docker_config"; then
-          echo "PR runner has Docker registry authentication configured (config.json)" >&2
-          exit 1
-        fi
+        docker_auth_config="${DOCKER_AUTH_CONFIG:-}"
+        AUDIT_DOCKER_AUTH_CONFIG="$docker_auth_config" \
+          AUDIT_DOCKER_CONFIG_PATH="$docker_config" \
+          AUDIT_DEPOT_SELECTED="$depot_selected" \
+          "$python_bin" - <<'PY'
+        import json
+        import os
+        import sys
+
+        depot_selected = os.environ.get("AUDIT_DEPOT_SELECTED", "")
+        auth_config = os.environ.get("AUDIT_DOCKER_AUTH_CONFIG", "")
+        config_path = os.environ.get("AUDIT_DOCKER_CONFIG_PATH", "")
+
+        def fail(message):
+            print(message, file=sys.stderr)
+            raise SystemExit(1)
+
+        def reject_constant(value):
+            raise ValueError(f"non-standard JSON constant: {value}")
+
+        def parse_source(label, raw):
+            try:
+                document = json.loads(raw, parse_constant=reject_constant)
+            except (TypeError, ValueError, RecursionError):
+                fail(f"PR runner Docker auth JSON is malformed ({label})")
+            if not isinstance(document, dict):
+                fail(f"PR runner Docker auth JSON is malformed ({label})")
+
+            if depot_selected == "true":
+                # Preserve the strict Depot policy: a Docker auth/config
+                # section is forbidden even when it is empty.  A valid config
+                # without any auth section remains an inert Docker config.
+                if any(name in document for name in ("auths", "credHelpers", "credsStore")):
+                    fail(f"PR runner has Docker registry authentication configured ({label})")
+                return
+
+            for name in ("auths", "credHelpers"):
+                if name not in document:
+                    continue
+                section = document[name]
+                if not isinstance(section, dict):
+                    fail(f"PR runner Docker auth JSON is malformed ({label})")
+                if any("depot.dev" in key.casefold() for key in section):
+                    fail(
+                        "Hosted PR runner has Depot Docker registry authentication "
+                        f"configured ({label})"
+                    )
+            if "credsStore" in document:
+                store = document["credsStore"]
+                if not isinstance(store, str):
+                    fail(f"PR runner Docker auth JSON is malformed ({label})")
+                if "depot.dev" in store.casefold():
+                    fail(
+                        "Hosted PR runner has Depot Docker registry authentication "
+                        f"configured ({label})"
+                    )
+
+        if depot_selected == "true" and auth_config:
+            fail("PR runner has Docker registry authentication configured (DOCKER_AUTH_CONFIG)")
+        if auth_config:
+            parse_source("DOCKER_AUTH_CONFIG", auth_config)
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    parse_source("config.json", config_file.read())
+            except UnicodeError:
+                fail("PR runner Docker auth JSON is malformed (config.json)")
+            except OSError:
+                fail("PR runner Docker auth JSON could not be read (config.json)")
+        PY
