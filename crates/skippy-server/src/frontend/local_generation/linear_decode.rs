@@ -103,6 +103,8 @@ impl StageOpenAiBackend {
                 return Ok(LinearProposalProgress::NotUsed);
             }
             Ok(outcome) => {
+                // The source has synchronously received this delta; do not
+                // resend it on the next proposal boundary.
                 state.pending_linear_proposal_tokens.clear();
                 match outcome {
                     LinearProposalQueryOutcome::Skipped => unreachable!("handled above"),
@@ -484,6 +486,7 @@ mod tests {
                             committed_tokens: [41, 42].into(),
                             verification_row_predictions: [41, 42, 43].into(),
                             canonical_prediction_count: 2,
+                            generated_token_count: 2,
                             correction_or_boundary_token: Some(43),
                             base_position: 1,
                             position_after_verification: 4,
