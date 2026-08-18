@@ -13,9 +13,9 @@ use crate::frontend::generation_receipt::{
 use crate::frontend::linear_proposal::greedy_linear_proposal_admitted;
 use crate::frontend::util::openai_backend_error;
 use crate::frontend::util::saturating_u32;
-use crate::kv_integration::KvStageIntegration;
 use crate::kv_integration::proactive_eviction_attrs;
 use crate::kv_integration::proactive_eviction_error_kind;
+use crate::kv_integration::{KvStageIntegration, StagePrefixCachePayload};
 use crate::runtime_state::{RuntimeSessionStats, RuntimeState};
 use openai_frontend::ChatCompletionRequest;
 use openai_frontend::OpenAiError;
@@ -67,6 +67,12 @@ struct KvRecordResult {
 pub(super) struct DecodeState {
     pub(super) decoded_tokens: usize,
     pub(super) current: i32,
+    /// Target-authoritative tokens emitted by this request. The runtime has
+    /// consumed every token in `prompt_token_ids + generated_token_ids` except
+    /// the final element: autoregressive decode consumes `current` and returns
+    /// the next (still unconsumed) token. This lets us name the recurrent state
+    /// at the exact token boundary that was actually captured.
+    pub(super) generated_token_ids: Vec<i32>,
     pub(super) stopped: bool,
     pub(super) runtime_lock_wait_ms: f64,
     pub(super) runtime_lock_wait_max_ms: f64,
@@ -92,6 +98,32 @@ pub(super) enum LinearProposalProgress {
     NotUsed,
     Continue,
     Stop,
+}
+
+pub(in crate::frontend) fn post_decode_checkpoint_tokens(
+    prompt_token_ids: &[i32],
+    generated_token_ids: &[i32],
+) -> Option<Vec<i32>> {
+    if generated_token_ids.is_empty() {
+        return None;
+    }
+    let mut checkpoint = Vec::with_capacity(
+        prompt_token_ids
+            .len()
+            .saturating_add(generated_token_ids.len())
+            .saturating_sub(1),
+    );
+    checkpoint.extend_from_slice(prompt_token_ids);
+    checkpoint
+        .extend_from_slice(&generated_token_ids[..generated_token_ids.len().saturating_sub(1)]);
+    Some(checkpoint)
+}
+
+pub(in crate::frontend) fn linear_proposal_allowed(
+    recurrent_checkpoint_required: bool,
+    checkpoint_attempted: bool,
+) -> bool {
+    !recurrent_checkpoint_required || checkpoint_attempted
 }
 
 impl StageOpenAiBackend {
@@ -360,7 +392,30 @@ impl StageOpenAiBackend {
         let mut decoded_prefill_suffix = false;
         if restored_prefill_tokens < prefill_tokens.len() {
             decoded_prefill_suffix = true;
-            if let Some(kv) = self.kv.as_ref().filter(|kv| kv.payload_is_exact_state()) {
+            if let Some(checkpoint_tokens) =
+                request
+                    .recurrent_cache_prefix_token_ids
+                    .filter(|checkpoint_tokens| {
+                        !checkpoint_tokens.is_empty()
+                            && checkpoint_tokens.len() <= prefill_tokens.len()
+                            && prefill_tokens.starts_with(checkpoint_tokens)
+                            && restored_prefill_tokens < checkpoint_tokens.len()
+                    })
+            {
+                runtime
+                    .prefill(session_id, &checkpoint_tokens[restored_prefill_tokens..])
+                    .map_err(openai_backend_error)?;
+                let _ = self.record_exact_state_at_tokens(
+                    &mut runtime,
+                    session_id,
+                    request.ids,
+                    checkpoint_tokens,
+                    "chat_prefix_checkpoint",
+                );
+                runtime
+                    .prefill(session_id, &prefill_tokens[checkpoint_tokens.len()..])
+                    .map_err(openai_backend_error)?;
+            } else if let Some(kv) = self.kv.as_ref().filter(|kv| kv.payload_is_exact_state()) {
                 // Recurrent and full-state payloads cannot reconstruct a shorter
                 // shared prefix from the state at the end of the request. Stop
                 // at the near-tail grid boundary while prefilling and snapshot
@@ -895,6 +950,163 @@ impl StageOpenAiBackend {
         }
     }
 
+    fn record_post_decode_exact_state(
+        &self,
+        request: &LocalGeneration<'_>,
+        session_id: &str,
+        state: &DecodeState,
+    ) -> bool {
+        let Some(kv) = self.kv.as_ref() else {
+            return false;
+        };
+        if kv.payload != StagePrefixCachePayload::KvRecurrent {
+            return false;
+        }
+        let Some(checkpoint_tokens) =
+            post_decode_checkpoint_tokens(request.prompt_token_ids, &state.generated_token_ids)
+        else {
+            return false;
+        };
+        let lock_timer = PhaseTimer::start();
+        let mut attrs = self.openai_attrs(request.ids);
+        let Ok(mut runtime) = self.runtime.lock() else {
+            attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!("post_decode_checkpoint_runtime_lock_poisoned"),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_wait_ms".to_string(),
+                json!(lock_timer.elapsed_ms()),
+            );
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
+            return false;
+        };
+        let runtime_lock_wait_ms = lock_timer.elapsed_ms();
+        let recorded = self.record_exact_state_at_tokens(
+            &mut runtime,
+            session_id,
+            request.ids,
+            &checkpoint_tokens,
+            "post_decode_checkpoint",
+        );
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!(if recorded {
+                "post_decode_checkpoint_recorded"
+            } else {
+                "post_decode_checkpoint_skipped"
+            }),
+        );
+        attrs.insert(
+            "llama_stage.runtime_lock_wait_ms".to_string(),
+            json!(runtime_lock_wait_ms),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_record_decision", attrs);
+        recorded
+    }
+
+    /// Record a recurrent state only when the native session is at the exact
+    /// token boundary named by `checkpoint_tokens`.
+    ///
+    /// The caller must hold the runtime lock. This check is intentionally
+    /// canonical-position based: token text or a caller-supplied count cannot
+    /// authorize exporting a state at a different native position.
+    fn record_exact_state_at_tokens(
+        &self,
+        runtime: &mut RuntimeState,
+        session_id: &str,
+        ids: &OpenAiGenerationIds,
+        checkpoint_tokens: &[i32],
+        decision_prefix: &str,
+    ) -> bool {
+        let Some(kv) = self.kv.as_ref() else {
+            return false;
+        };
+        if kv.payload != StagePrefixCachePayload::KvRecurrent {
+            return false;
+        }
+        let Ok(checkpoint_token_count) = u64::try_from(checkpoint_tokens.len()) else {
+            return false;
+        };
+        let runtime_token_count = match runtime.canonical_session_position(session_id) {
+            Ok(position) => position,
+            Err(error) => {
+                let mut attrs = self.openai_attrs(ids);
+                attrs.insert(
+                    "skippy.kv.decision".to_string(),
+                    json!(format!("{decision_prefix}_skipped")),
+                );
+                attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
+                self.telemetry
+                    .emit("stage.openai_kv_record_decision", attrs);
+                return false;
+            }
+        };
+        if runtime_token_count != checkpoint_token_count {
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!(format!("{decision_prefix}_skipped")),
+            );
+            attrs.insert(
+                "skippy.kv.checkpoint_token_count".to_string(),
+                json!(checkpoint_token_count),
+            );
+            attrs.insert(
+                "skippy.kv.runtime_token_count".to_string(),
+                json!(runtime_token_count),
+            );
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
+            return false;
+        }
+
+        let base = self.local_kv_message_base(session_id, ids);
+        let identity = kv.prefill_identity(&self.config, &base, 0, checkpoint_tokens);
+        match kv.record_exact_state(runtime, session_id, &identity) {
+            Ok(Some(record)) => {
+                let mut attrs = self.openai_attrs(ids);
+                attrs.insert(
+                    "skippy.kv.decision".to_string(),
+                    json!(format!("{decision_prefix}_recorded")),
+                );
+                attrs.insert(
+                    "skippy.exact_cache.recorded_page_id".to_string(),
+                    json!(record.page_id),
+                );
+                attrs.insert(
+                    "skippy.exact_cache.payload_kind".to_string(),
+                    json!(record.payload_kind.to_string()),
+                );
+                attrs.insert(
+                    "skippy.exact_cache.recorded_tokens".to_string(),
+                    json!(record.token_count),
+                );
+                attrs.insert(
+                    "skippy.exact_cache.stored".to_string(),
+                    json!(record.stored),
+                );
+                self.telemetry
+                    .emit("stage.openai_kv_record_decision", attrs);
+                record.stored
+            }
+            Ok(None) => false,
+            Err(error) => {
+                let mut attrs = self.openai_attrs(ids);
+                attrs.insert(
+                    "skippy.kv.decision".to_string(),
+                    json!(format!("{decision_prefix}_error")),
+                );
+                attrs.insert("skippy.kv.error".to_string(), json!(error.to_string()));
+                self.telemetry
+                    .emit("stage.openai_kv_record_decision", attrs);
+                false
+            }
+        }
+    }
+
     fn configure_chat_sampling(
         &self,
         session_id: &str,
@@ -944,6 +1156,7 @@ impl StageOpenAiBackend {
             .last()
             .expect("checked non-empty prompt");
         let mut stopped = false;
+        let mut generated_token_ids = Vec::new();
         let mut pending_linear_proposal_tokens = Vec::new();
         if let Some(predicted) = prompt_prefill_sample {
             if request
@@ -954,6 +1167,7 @@ impl StageOpenAiBackend {
             }
             current = predicted;
             decoded_tokens += 1;
+            generated_token_ids.push(current);
             pending_linear_proposal_tokens.push(current);
             stopped = emit_token(current)? == TokenControl::Stop;
         }
@@ -990,6 +1204,7 @@ impl StageOpenAiBackend {
         Ok(DecodeState {
             decoded_tokens,
             current,
+            generated_token_ids,
             stopped,
             runtime_lock_wait_ms: 0.0,
             runtime_lock_wait_max_ms: 0.0,
@@ -1024,6 +1239,17 @@ impl StageOpenAiBackend {
         let decode_timer = PhaseTimer::start();
         let mut state =
             self.prepare_decode_state(request, session_id, prompt_prefill_sample, emit_token)?;
+        let recurrent_checkpoint_required = self
+            .kv
+            .as_ref()
+            .is_some_and(|kv| kv.payload == StagePrefixCachePayload::KvRecurrent);
+        // A recurrent request needs one serial decode before proposals can
+        // advance the native session beyond the prompt boundary. The serial
+        // attempt is the gate: a short prompt may be below the policy's
+        // minimum checkpoint size, in which case recording is correctly
+        // skipped but proposals must not remain disabled for the rest of the
+        // request.
+        let mut first_post_decode_checkpoint_attempted = !recurrent_checkpoint_required;
         while !state.stopped && state.decoded_tokens < request.max_tokens as usize {
             if request
                 .cancellation
@@ -1032,12 +1258,28 @@ impl StageOpenAiBackend {
                 *receipt_cancelled = true;
                 break;
             }
-            match self.try_execute_linear_proposal(request, session_id, &mut state, emit_token)? {
+            let linear_progress = if linear_proposal_allowed(
+                recurrent_checkpoint_required,
+                first_post_decode_checkpoint_attempted,
+            ) {
+                self.try_execute_linear_proposal(request, session_id, &mut state, emit_token)?
+            } else {
+                // A proposal can consume the final prompt token and commit
+                // multiple target tokens in one call. Give recurrent caches
+                // one serial decode first so the exact full-prompt boundary
+                // is published before that proposal advances the session.
+                LinearProposalProgress::NotUsed
+            };
+            match linear_progress {
                 LinearProposalProgress::Continue => continue,
                 LinearProposalProgress::Stop => break,
                 LinearProposalProgress::NotUsed => {}
             }
             let control = self.decode_one_token(request, session_id, &mut state, emit_token)?;
+            if !first_post_decode_checkpoint_attempted && state.generated_token_ids.len() == 1 {
+                first_post_decode_checkpoint_attempted = true;
+                self.record_post_decode_exact_state(request, session_id, &state);
+            }
             if state.linear_proposal_max_tokens > 0 {
                 state.pending_linear_proposal_tokens.push(state.current);
             }
@@ -1045,7 +1287,15 @@ impl StageOpenAiBackend {
                 break;
             }
         }
-        self.emit_decode_summary(request, &mut state, cache_stats, decode_timer)
+        let model_generation_elapsed =
+            self.emit_decode_summary(request, &mut state, cache_stats, decode_timer)?;
+        // The first-token checkpoint names the prompt boundary. Avoid
+        // exporting the same recurrent state twice for a one-token response;
+        // longer responses still get their final exact boundary recorded.
+        if state.generated_token_ids.len() > 1 {
+            let _ = self.record_post_decode_exact_state(request, session_id, &state);
+        }
+        Ok(model_generation_elapsed)
     }
 }
 
