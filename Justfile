@@ -471,6 +471,7 @@ ci-validate:
     python3 -m unittest discover -s scripts/tests -p 'test_*.py'
     just ci-crate-lists
     just check-release
+    just no-console-print
     just publish-crates
 
 # Run CI/workspace crate-list consistency checks.
@@ -480,6 +481,12 @@ ci-crate-lists:
 # Run crates.io publish-chain consistency checks.
 publish-crates:
     just with-lld cargo run -p xtask -- repo-consistency publish-crates
+
+# Ratchet on println!/eprintln!/print!/eprint! in Rust files under crates/
+# (including crate test targets; build.rs is skipped): every occurrence must be
+# explicitly listed in tools/xtask/data/console_print_allowlist.json.
+no-console-print:
+    cargo run -p xtask -- repo-consistency no-console-print
 
 # Shellcheck the explicitly supplied changed shell scripts.
 ci-shellcheck *scripts:
