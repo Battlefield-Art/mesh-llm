@@ -362,6 +362,37 @@ describe('useLogsLiveRecovery', () => {
     expect(hydrateAudit).toHaveBeenCalledTimes(2)
   })
 
+  it('does not re-hydrate when the audit stream fails to reconnect a second time while already polling', async () => {
+    vi.useFakeTimers()
+    const { hydrateAudit, result, sources } = renderLive({ enabled: false, auditEnabled: true })
+    await flush()
+    const source = sources[0]
+
+    act(() => source?.error())
+    expect(result.current.state).toBe('reconnecting')
+    act(() => vi.advanceTimersByTime(1_000))
+    await flush()
+    expect(result.current.state).toBe('polling')
+    expect(hydrateAudit).toHaveBeenCalledTimes(1)
+
+    // Native EventSource retries on its own schedule and calls onerror again on
+    // every failed attempt. A second failure while already polling must not
+    // re-enter startPolling and fire a duplicate hydrate — the reconciliation
+    // interval from the first entry is still live and owns future refreshes.
+    act(() => source?.error())
+    act(() => vi.advanceTimersByTime(1_000))
+    await flush()
+    expect(result.current.state).toBe('polling')
+    expect(hydrateAudit).toHaveBeenCalledTimes(1)
+
+    // The reconciliation interval from the first entry must still be the one
+    // driving refreshes — the second failure should not have restarted or
+    // dropped it.
+    act(() => vi.advanceTimersByTime(5_000))
+    await flush()
+    expect(hydrateAudit).toHaveBeenCalledTimes(2)
+  })
+
   it('serializes route and reconnects while source remains unsupported', async () => {
     const { rerender, sources } = renderLive({ search: { route: 'reserve', source: 'active' } })
     await flush()
@@ -604,6 +635,9 @@ describe('useLogsLiveRecovery', () => {
     const source = sources[0]
     act(() => source?.error())
     act(() => vi.advanceTimersByTime(1_000))
+    await flush()
+    // Entering polling hydrates once immediately, before any interval tick.
+    expect(hydrate).toHaveBeenCalledTimes(1)
     const timerCount = vi.getTimerCount()
     const togglePolling = result.current.togglePolling
 
@@ -615,7 +649,7 @@ describe('useLogsLiveRecovery', () => {
     expect(vi.getTimerCount()).toBe(timerCount)
     act(() => vi.advanceTimersByTime(15_000))
     await flush()
-    expect(hydrate).not.toHaveBeenCalled()
+    expect(hydrate).toHaveBeenCalledTimes(1)
     expect(sources).toHaveLength(1)
     expect(source?.closed).toBe(false)
   })
