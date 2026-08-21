@@ -587,11 +587,18 @@ pub(super) fn configure_run_auto_process_state(
     options: &RuntimeOptions,
     runtime: Option<&std::sync::Arc<crate::runtime::instance::InstanceRuntime>>,
 ) {
+    // SAFETY: UNSAFE CONTRACT — callers must invoke this before concurrent
+    // runtime work can access the process environment. The current runtime
+    // startup path does not enforce that boundary; retain the audit TODO.
     // TODO: Audit that the environment access only happens in single-threaded code.
     unsafe {
         if options.local_model_only {
+            // SAFETY: UNSAFE CONTRACT — callers must establish the startup ordering above.
+            // TODO: Audit that the environment access only happens in single-threaded code.
             std::env::remove_var("MESH_API_PORT");
         } else {
+            // SAFETY: UNSAFE CONTRACT — callers must establish the startup ordering above.
+            // TODO: Audit that the environment access only happens in single-threaded code.
             std::env::set_var("MESH_API_PORT", options.console.to_string());
         }
     }

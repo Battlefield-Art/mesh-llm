@@ -408,6 +408,14 @@ check-release:
 check-release:
     @just with-lld cargo run -p xtask -- repo-consistency release-targets
 
+# Check the Rust process-environment mutation census and contract annotations.
+check-env-mutation-contract:
+    @python3 scripts/check-env-mutation-contract.py
+
+# Run one release-attestation xtask action through the repository toolchain.
+release-attestation *ARGS:
+    @just with-lld cargo run -q -p xtask -- release-attestation {{ ARGS }}
+
 release-bundle-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}"
 
