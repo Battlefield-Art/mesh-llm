@@ -129,6 +129,8 @@ pub struct Node {
             >,
         >,
     >,
+    pub(crate) stage_control_lifecycle:
+        Arc<Mutex<Option<crate::inference::skippy::StageControlHandle>>>,
     pub(crate) stage_transport_bridges: Arc<Mutex<HashMap<String, StageTransportBridge>>>,
     pub(crate) stage_transport_aliases: Arc<Mutex<HashMap<String, String>>>,
     pub(crate) stage_topologies: Arc<Mutex<StageTopologyState>>,
@@ -692,6 +694,17 @@ impl Node {
             let _ = lifecycle.task.await;
             close_endpoint_gracefully(&lifecycle.endpoint, "owner-control").await;
         }
+        self.shutdown_stage_control().await;
+    }
+
+    async fn shutdown_stage_control(&self) {
+        *self.stage_control_tx.lock().await = None;
+        let lifecycle = self.stage_control_lifecycle.lock().await.take();
+        if let Some(lifecycle) = lifecycle
+            && let Err(error) = lifecycle.shutdown().await
+        {
+            tracing::warn!("stage control shutdown failed: {error:#}");
+        }
     }
 
     /// Close the main mesh QUIC endpoint as the last step of runtime shutdown.
@@ -869,6 +882,7 @@ impl Node {
             tunnel_http_tx,
             stage_transport_tx,
             stage_control_tx: Arc::new(Mutex::new(None)),
+            stage_control_lifecycle: Arc::new(Mutex::new(None)),
             stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
             stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
             stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
@@ -1045,6 +1059,7 @@ impl Node {
             tunnel_http_tx,
             stage_transport_tx,
             stage_control_tx: Arc::new(Mutex::new(None)),
+            stage_control_lifecycle: Arc::new(Mutex::new(None)),
             stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
             stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
             stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
