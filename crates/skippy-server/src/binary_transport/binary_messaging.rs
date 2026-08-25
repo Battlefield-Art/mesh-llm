@@ -15,7 +15,6 @@ use super::stage_execution::{
     warm_downstream_preconnect_enabled,
 };
 use super::{
-    decode_batcher::DecodeFrameBatcher,
     direct_return::{PredictionReturnHub, PredictionReturnSinks},
     options::BinaryStageOptions,
     preconnect::DownstreamPreconnector,
@@ -23,7 +22,7 @@ use super::{
 use crate::{
     cli::ServeBinaryArgs,
     config::validate_config,
-    frontend::{self, EmbeddedOpenAiArgs},
+    frontend::{self, EmbeddedOpenAiArgs, iteration_scheduler::IterationScheduler},
     kv_integration::KvStageIntegration,
     runtime_state::{RuntimeLaunchOverrides, load_runtime_with_overrides},
     telemetry::{Telemetry, lifecycle_attrs},
@@ -204,7 +203,6 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         },
     )?
     .context("binary stage server requires model_path")?;
-    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), max_inflight);
     if max_inflight > 0 {
         let timer = Instant::now();
         let sessions = runtime
@@ -232,6 +230,13 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         );
         telemetry.emit("stage.binary_runtime_prewarm", attrs);
     }
+    let iteration_scheduler = IterationScheduler::new(
+        runtime.clone(),
+        &config,
+        max_inflight.max(1),
+        telemetry.clone(),
+    )
+    .map_err(|error| anyhow!("create binary iteration scheduler: {error}"))?;
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
     let prediction_returns = Arc::new(PredictionReturnHub::default());
     let prediction_return_sinks = Arc::new(PredictionReturnSinks::default());
@@ -244,46 +249,53 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         }
         let openai_config = config.clone();
         let openai_runtime = runtime.clone();
+        let openai_iteration_scheduler = iteration_scheduler.clone();
         let openai_telemetry = telemetry.clone();
         let openai_prediction_returns = prediction_returns.clone();
         tokio::spawn(async move {
-            if let Err(error) = frontend::serve_embedded_openai(EmbeddedOpenAiArgs {
-                bind_addr: openai_options.bind_addr,
-                config: openai_config,
-                runtime: openai_runtime,
-                model_id: openai_options.model_id,
-                default_max_tokens: openai_options.default_max_tokens,
-                request_defaults: frontend::EmbeddedOpenAiRequestDefaults::default(),
-                generation_concurrency: openai_options.generation_concurrency,
-                prefill_chunk_size: openai_options.prefill_chunk_size,
-                prefill_chunk_policy: openai_options.prefill_chunk_policy,
-                prefill_chunk_schedule: openai_options.prefill_chunk_schedule,
-                prefill_adaptive_start: openai_options.prefill_adaptive_start,
-                prefill_adaptive_step: openai_options.prefill_adaptive_step,
-                prefill_adaptive_max: openai_options.prefill_adaptive_max,
-                draft_model_path: openai_options.draft_model_path,
-                speculative_window: openai_options.speculative_window,
-                adaptive_speculative_window: openai_options.adaptive_speculative_window,
-                draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
-                speculative: openai_options.speculative.clone(),
-                native_mtp_enabled: native_mtp_enabled
-                    && openai_options.speculative.native_mtp.enabled,
-                native_mtp_draft_model_path: openai_options.native_mtp_draft_model_path,
-                native_mtp_max_tokens: openai_options.native_mtp_max_tokens,
-                native_mtp_min_tokens: openai_options.native_mtp_min_tokens,
-                activation_width,
-                wire_dtype,
-                reply_credit_limit,
-                downstream_connect_timeout_secs,
-                downstream_wire_condition,
-                prediction_returns: Some(openai_prediction_returns),
-                telemetry: openai_telemetry,
-                hook_policy: None,
-                generation_receipt: None,
-                linear_proposal_ingress: None,
-                openai_guardrails: Some(frontend::OpenAiGuardrailsConfig::disabled_for_skippy()),
-            })
-            .await
+            if let Err(error) =
+                frontend::serve_embedded_openai_with_scheduler(
+                    EmbeddedOpenAiArgs {
+                        bind_addr: openai_options.bind_addr,
+                        config: openai_config,
+                        runtime: openai_runtime,
+                        model_id: openai_options.model_id,
+                        default_max_tokens: openai_options.default_max_tokens,
+                        request_defaults: frontend::EmbeddedOpenAiRequestDefaults::default(),
+                        generation_concurrency: openai_options.generation_concurrency,
+                        prefill_chunk_size: openai_options.prefill_chunk_size,
+                        prefill_chunk_policy: openai_options.prefill_chunk_policy,
+                        prefill_chunk_schedule: openai_options.prefill_chunk_schedule,
+                        prefill_adaptive_start: openai_options.prefill_adaptive_start,
+                        prefill_adaptive_step: openai_options.prefill_adaptive_step,
+                        prefill_adaptive_max: openai_options.prefill_adaptive_max,
+                        draft_model_path: openai_options.draft_model_path,
+                        speculative_window: openai_options.speculative_window,
+                        adaptive_speculative_window: openai_options.adaptive_speculative_window,
+                        draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
+                        speculative: openai_options.speculative.clone(),
+                        native_mtp_enabled: native_mtp_enabled
+                            && openai_options.speculative.native_mtp.enabled,
+                        native_mtp_draft_model_path: openai_options.native_mtp_draft_model_path,
+                        native_mtp_max_tokens: openai_options.native_mtp_max_tokens,
+                        native_mtp_min_tokens: openai_options.native_mtp_min_tokens,
+                        activation_width,
+                        wire_dtype,
+                        reply_credit_limit,
+                        downstream_connect_timeout_secs,
+                        downstream_wire_condition,
+                        prediction_returns: Some(openai_prediction_returns),
+                        telemetry: openai_telemetry,
+                        hook_policy: None,
+                        generation_receipt: None,
+                        linear_proposal_ingress: None,
+                        openai_guardrails: Some(
+                            frontend::OpenAiGuardrailsConfig::disabled_for_skippy(),
+                        ),
+                    },
+                    openai_iteration_scheduler,
+                )
+                .await
             {
                 eprintln!("embedded OpenAI server failed: {error:#}");
             }
@@ -324,8 +336,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
             );
             let config = config.clone();
             let topology = topology.clone();
-            let runtime = runtime.clone();
-            let decode_frame_batcher = decode_frame_batcher.clone();
+            let iteration_scheduler = iteration_scheduler.clone();
             let kv = kv.clone();
             let telemetry = telemetry.clone();
             let warm_downstream = warm_downstream.clone();
@@ -377,8 +388,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     handle_binary_connection(
                         &config,
                         topology.as_ref(),
-                        &runtime,
-                        &decode_frame_batcher,
+                        &iteration_scheduler,
                         kv.as_ref(),
                         &telemetry,
                         &mut upstream,

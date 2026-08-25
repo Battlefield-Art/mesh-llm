@@ -32,13 +32,21 @@ impl ResidentCacheConfig {
             .max(2);
         let max_resident_tokens = derive_max_resident_tokens(u64::from(config.ctx_size));
         Self {
-            max_entries: cache.max_entries.clamp(1, 512),
+            max_entries: cap_resident_entries(cache.max_entries, reserved_seq_count),
             max_bytes: cache.max_bytes,
             min_tokens: cache.min_tokens,
             reserved_seq_count,
             max_resident_tokens,
         }
     }
+}
+
+fn cap_resident_entries(configured_entries: usize, reserved_seq_count: i32) -> usize {
+    let available_sequence_ids = crate::LLAMA_MAX_SEQ.saturating_sub(reserved_seq_count) as usize;
+    if available_sequence_ids == 0 {
+        return 0;
+    }
+    configured_entries.clamp(1, 512).min(available_sequence_ids)
 }
 
 /// Derive `max_resident_tokens` from the model's `n_ctx` cell pool.
@@ -97,6 +105,13 @@ mod resident_cache_config_tests {
         // Below the hard floor.
         assert_eq!(derive_max_resident_tokens(8191), 0);
         assert_eq!(derive_max_resident_tokens(4096), 0);
+    }
+
+    #[test]
+    fn resident_entry_cap_fits_available_sequence_ids() {
+        assert_eq!(cap_resident_entries(512, 8), 248);
+        assert_eq!(cap_resident_entries(64, 8), 64);
+        assert_eq!(cap_resident_entries(64, crate::LLAMA_MAX_SEQ), 0);
     }
 }
 
