@@ -12,9 +12,10 @@ use crate::telemetry::Telemetry;
 use openai_frontend::{OpenAiError, OpenAiResult};
 use serde_json::json;
 use skippy_protocol::StageConfig;
-use skippy_runtime::{ActivationFrame, SamplingConfig};
+use skippy_runtime::{ActivationFrame, IterationBatchPhase, SamplingConfig};
 use skippy_scheduler::{
-    AdmissionError, CacheAffinity, MemoryComponent, Scheduler, SchedulerConfig, Sequence,
+    AdmissionError, CacheAffinity, IterationPhase, MemoryComponent, Scheduler, SchedulerConfig,
+    Sequence,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
@@ -94,6 +95,7 @@ struct DirectIteration {
     sampling: Option<SamplingConfig>,
     input: Option<ActivationFrame>,
     sample_last: bool,
+    phase: IterationBatchPhase,
     enqueued_at: Instant,
     reply: std_mpsc::SyncSender<OpenAiResult<SchedulerIterationOutcome>>,
 }
@@ -363,6 +365,7 @@ impl IterationScheduler {
         positions: &[i32],
         sampling: Option<&SamplingConfig>,
         sample_last: bool,
+        phase: IterationBatchPhase,
     ) -> OpenAiResult<SchedulerIterationOutcome> {
         self.execute_direct_iteration(
             session_id,
@@ -372,6 +375,7 @@ impl IterationScheduler {
             sampling,
             None,
             sample_last,
+            phase,
         )
     }
 
@@ -394,6 +398,7 @@ impl IterationScheduler {
             sampling,
             input,
             sample_last,
+            IterationBatchPhase::Decode,
         )
     }
 
@@ -407,6 +412,7 @@ impl IterationScheduler {
         sampling: Option<&SamplingConfig>,
         input: Option<ActivationFrame>,
         sample_last: bool,
+        phase: IterationBatchPhase,
     ) -> OpenAiResult<SchedulerIterationOutcome> {
         validate_direct_iteration(token_ids, positions)?;
         let (reply, result) = std_mpsc::sync_channel(1);
@@ -418,6 +424,7 @@ impl IterationScheduler {
             sampling: sampling.cloned(),
             input,
             sample_last,
+            phase,
             enqueued_at: Instant::now(),
             reply,
         }))?;
@@ -893,6 +900,7 @@ impl SchedulerWorker {
                 sampling: request.sampling.as_ref(),
                 input: request.input.as_ref(),
                 sample_last: request.sample_last,
+                phase: request.phase,
             })
             .collect::<Vec<_>>();
         let result = runtime
@@ -1180,6 +1188,12 @@ impl SchedulerWorker {
                 sampling: work.sampling.as_ref(),
                 input: None,
                 sample_last: work.sample_last,
+                phase: match work.phase {
+                    IterationPhase::Decode => IterationBatchPhase::Decode,
+                    IterationPhase::Prefill | IterationPhase::Recompute => {
+                        IterationBatchPhase::Prefill
+                    }
+                },
             })
             .collect::<Vec<_>>();
         runtime
@@ -1409,6 +1423,7 @@ mod tests {
             sampling: None,
             input: None,
             sample_last: true,
+            phase: IterationBatchPhase::Prefill,
             enqueued_at: Instant::now(),
             reply,
         }
@@ -1684,6 +1699,19 @@ mod tests {
             }
             .run();
         });
+        let (worker_blocked, worker_blocked_rx) = std_mpsc::sync_channel(0);
+        let (release_worker, release_worker_rx) = std_mpsc::sync_channel(0);
+        commands
+            .send(SchedulerCommand::ExecuteRuntime(RuntimeOperation {
+                label: "panic-test-gate",
+                run: Box::new(move |_| {
+                    worker_blocked.send(()).unwrap();
+                    release_worker_rx.recv().unwrap();
+                }),
+            }))
+            .unwrap();
+        worker_blocked_rx.recv().unwrap();
+
         let (reply, events) = std_mpsc::channel();
         commands
             .send(SchedulerCommand::Submit(ScheduledRequest {
@@ -1701,6 +1729,7 @@ mod tests {
                 run: Box::new(|_| panic!("injected scheduler worker panic")),
             }))
             .unwrap();
+        release_worker.send(()).unwrap();
 
         let SchedulerEvent::Error(error) = events.recv().unwrap() else {
             panic!("expected contained worker panic to fail the request");
