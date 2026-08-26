@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::Result;
 use skippy_cache::{
-    ExactStateCache, PrefixCandidatePolicy, ResidentActivationCache, ResidentCacheConfig,
-    ResidentPrefixCache,
+    CacheBlobStore, ResidentActivationCache, ResidentCacheConfig, SparseCheckpointPolicy,
+    UnifiedRadixCache,
 };
 use skippy_protocol::{
     LoadMode, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
@@ -17,8 +17,8 @@ use skippy_runtime::ModelInfo;
 use skippy_topology::{STAGE_RUNTIME_LLAMA_FAMILY_EXPECTATIONS, infer_family_capability};
 
 use super::{
-    EXACT_STATE_RECORD_CAPACITY, ExactStateExtra, KvStageIntegration, PendingExactStateRecord,
-    StageKvMode, StagePrefixCachePayload,
+    EXACT_STATE_RECORD_CAPACITY, KvStageIntegration, PendingExactStateRecord, RadixExactEntry,
+    ResidentSequencePool, StageKvMode, StagePrefixCachePayload,
 };
 
 impl KvStageIntegration {
@@ -43,26 +43,27 @@ impl KvStageIntegration {
         {
             return Ok(None);
         }
-        let mut candidate_policy = PrefixCandidatePolicy::from_cache(&cache_config);
+        let mut checkpoint_policy = SparseCheckpointPolicy::from_cache(&cache_config);
         let resident_config = ResidentCacheConfig::from_stage(config, &cache_config);
         if resident_config.max_entries == 0 {
             return Ok(None);
         }
-        // Bound the record ladder by the same token budget the resident cache
-        // enforces, so a single request cannot record more than it can hold.
-        candidate_policy.max_resident_tokens_hint = resident_config.max_resident_tokens;
-        let exact_states = ExactStateCache::<ExactStateExtra>::new(
-            cache_config.max_entries.clamp(1, 512),
-            cache_config.max_bytes,
-        );
-        let exact_states = Arc::new(Mutex::new(exact_states));
+        // Activation checkpoints still use their own sparse policy; serving KV
+        // contributes one full token path to the radix tree.
+        checkpoint_policy.max_resident_tokens_hint = resident_config.max_resident_tokens;
+        let exact_max_entries = cache_config.max_entries.clamp(1, 512);
+        let exact_max_bytes = cache_config.max_bytes;
+        let radix = Arc::new(Mutex::new(UnifiedRadixCache::new()));
+        let exact_blobs = Arc::new(Mutex::new(CacheBlobStore::default()));
         let (exact_state_record_tx, exact_state_record_rx) =
             std::sync::mpsc::sync_channel::<PendingExactStateRecord>(EXACT_STATE_RECORD_CAPACITY);
-        let worker_exact_states = exact_states.clone();
+        let worker_radix = radix.clone();
+        let worker_exact_blobs = exact_blobs.clone();
         let inflight_records = Arc::new(Mutex::new(BTreeSet::new()));
         let worker_inflight_records = inflight_records.clone();
         let exact_state_records_queued = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let exact_state_records_dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_exact_state_records_dropped = exact_state_records_dropped.clone();
         let exact_state_records_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_exact_state_records_pending = exact_state_records_pending.clone();
         std::thread::Builder::new()
@@ -70,15 +71,18 @@ impl KvStageIntegration {
             .spawn(move || {
                 while let Ok(pending) = exact_state_record_rx.recv() {
                     let page_id = pending.page_id.clone();
-                    worker_exact_states
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record(
-                            pending.page_id,
-                            pending.token_count,
-                            pending.payload,
-                            pending.extra,
-                        );
+                    if store_exact_radix_record(
+                        &worker_radix,
+                        &worker_exact_blobs,
+                        exact_max_entries,
+                        exact_max_bytes,
+                        pending,
+                    )
+                    .is_err()
+                    {
+                        worker_exact_state_records_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     worker_inflight_records
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -92,11 +96,17 @@ impl KvStageIntegration {
             payload,
             correctness_mode: false,
             trust_local_writes: true,
-            candidate_policy,
+            checkpoint_policy,
             inflight_records,
-            resident: Arc::new(Mutex::new(ResidentPrefixCache::new(resident_config))),
+            resident_config,
+            resident_sequences: Arc::new(Mutex::new(ResidentSequencePool::new(
+                resident_config.reserved_seq_count,
+            ))),
             activations: Arc::new(Mutex::new(ResidentActivationCache::new(resident_config))),
-            exact_states,
+            radix,
+            exact_blobs,
+            exact_max_entries,
+            exact_max_bytes,
             exact_state_record_tx,
             exact_state_records_queued,
             exact_state_records_dropped,
@@ -106,6 +116,92 @@ impl KvStageIntegration {
             split_prefill_tokens: Arc::new(Mutex::new(BTreeMap::new())),
         }))
     }
+}
+
+fn store_exact_radix_record(
+    radix: &Mutex<UnifiedRadixCache<super::RadixResidentEntry, RadixExactEntry>>,
+    blobs: &Mutex<CacheBlobStore>,
+    max_entries: usize,
+    max_bytes: u64,
+    pending: PendingExactStateRecord,
+) -> Result<()> {
+    let logical_bytes = pending.payload.byte_len();
+    let (payload, _) = pending.payload.dedupe_into(
+        &mut blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    // Cloning retains the Arc-backed blocks without changing blob-store
+    // accounting, leaving `payload` available to roll that accounting back if
+    // the radix rejects the insert.
+    let mut released = Vec::new();
+    let insert_result = {
+        let mut radix = radix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let insert_result = radix.insert_recurrent(
+            pending.namespace,
+            &pending.token_ids,
+            logical_bytes,
+            RadixExactEntry {
+                page_id: pending.page_id,
+                payload: payload.clone(),
+                extra: pending.extra,
+            },
+        );
+        match insert_result {
+            Err(error) => Err(error),
+            Ok(replaced) => {
+                if let Some(replaced) = replaced {
+                    released.push(replaced.payload);
+                }
+                while radix.stats().recurrent_entries > max_entries {
+                    let Some(evicted) = radix.evict_lru_recurrent() else {
+                        break;
+                    };
+                    released.push(evicted.value.payload);
+                }
+                Ok(())
+            }
+        }
+    };
+    if let Err(error) = insert_result {
+        payload.release_from(
+            &mut blobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        return Err(error);
+    }
+    if !released.is_empty() {
+        let mut blobs = blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for payload in released {
+            payload.release_from(&mut blobs);
+        }
+    }
+    while max_bytes > 0
+        && blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .physical_bytes()
+            > max_bytes
+    {
+        let evicted = radix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evict_lru_recurrent();
+        let Some(evicted) = evicted else {
+            break;
+        };
+        evicted.value.payload.release_from(
+            &mut blobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+    Ok(())
 }
 
 fn effective_cache_payload(
@@ -332,6 +428,64 @@ fn parse_cache_mode(value: &str) -> Option<StageKvCacheMode> {
 mod tests {
     use super::*;
     use skippy_protocol::FlashAttentionType;
+
+    fn pending(page_id: &str, tokens: &[i32], bytes: &[u8]) -> PendingExactStateRecord {
+        PendingExactStateRecord {
+            page_id: page_id.to_string(),
+            payload: skippy_cache::ExactStatePayload::full_state(bytes.to_vec()),
+            extra: super::super::ExactStateExtra::default(),
+            namespace: "model".to_string(),
+            token_ids: tokens.to_vec(),
+        }
+    }
+
+    #[test]
+    fn exact_payloads_live_on_radix_nodes_and_release_deduped_blocks_on_eviction() {
+        let radix = Mutex::new(UnifiedRadixCache::new());
+        let blobs = Mutex::new(CacheBlobStore::new(4));
+
+        store_exact_radix_record(&radix, &blobs, 1, 0, pending("first", &[1, 2], b"aaaabbbb"))
+            .unwrap();
+        store_exact_radix_record(
+            &radix,
+            &blobs,
+            1,
+            0,
+            pending("second", &[1, 3], b"aaaacccc"),
+        )
+        .unwrap();
+
+        let mut radix = radix.lock().unwrap();
+        let blobs = blobs.lock().unwrap();
+        assert_eq!(radix.stats().recurrent_entries, 1);
+        assert_eq!(blobs.physical_bytes(), 8);
+        assert!(radix.lookup_recurrent("model", &[1, 2]).is_none());
+        assert_eq!(
+            radix
+                .lookup_recurrent("model", &[1, 3])
+                .expect("second exact payload should remain")
+                .value
+                .page_id,
+            "second"
+        );
+    }
+
+    #[test]
+    fn invalid_exact_radix_key_releases_deduped_payload() {
+        let radix = Mutex::new(UnifiedRadixCache::new());
+        let blobs = Mutex::new(CacheBlobStore::new(4));
+
+        let error =
+            store_exact_radix_record(&radix, &blobs, 1, 0, pending("empty", &[], b"aaaabbbb"))
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "radix cache key must contain at least one token"
+        );
+        assert_eq!(blobs.lock().unwrap().physical_bytes(), 0);
+        assert_eq!(radix.lock().unwrap().stats().recurrent_entries, 0);
+    }
 
     #[test]
     fn either_cache_kill_switch_disables_the_cache() {
