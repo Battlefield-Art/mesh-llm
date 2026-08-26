@@ -28,6 +28,8 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 SUMMARY_EVENT = "stage.openai_generation_summary"
+KV_CAPACITY_EVENT = "stage.openai_kv_capacity_decision"
+KV_RECORD_EVENT = "stage.openai_kv_record_decision"
 DEFAULT_FIXTURE_CATALOG = REPO / "evals/skippy-scheduler-fixtures.json"
 
 
@@ -135,6 +137,34 @@ def validate_fixture_inputs(
         raise ValueError("HF fixture profiles require a prepared prompt manifest")
     if corpus_kind == "synthetic" and prompt_manifest is not None:
         raise ValueError("synthetic fixture profiles do not accept a prompt manifest")
+
+
+def load_acceptance_contract(path: Path) -> dict[str, Any]:
+    document = json.loads(path.read_text())
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise ValueError("acceptance contract schema_version must be 1")
+    if not isinstance(document.get("name"), str) or not document["name"]:
+        raise ValueError("acceptance contract needs a nonempty name")
+    if not isinstance(document.get("workload_profile"), str):
+        raise ValueError("acceptance contract needs a workload_profile")
+    contract = document.get("hardware_acceptance")
+    if not isinstance(contract, dict) or "successful_requests_per_binary" not in contract:
+        raise ValueError("acceptance contract needs hardware_acceptance success bounds")
+    overrides = document.get("workload_overrides", {})
+    if not isinstance(overrides, dict) or set(overrides) - {"cache_entries"}:
+        raise ValueError("acceptance workload_overrides may only set cache_entries")
+    if overrides and int(overrides["cache_entries"]) <= 0:
+        raise ValueError("acceptance cache_entries override must be positive")
+    seed = document.get("cache_seed")
+    if seed is not None:
+        if not isinstance(seed, dict):
+            raise ValueError("acceptance cache_seed must be an object")
+        required_seed_keys = {"families", "prefix_blocks", "output_tokens", "stagger_ms"}
+        if set(seed) != required_seed_keys:
+            raise ValueError("acceptance cache_seed keys do not match the schema")
+        if any(float(seed[key]) <= 0 for key in required_seed_keys):
+            raise ValueError("acceptance cache_seed values must be positive")
+    return document
 
 
 def percentile(values: list[float], quantile: float) -> float | None:
@@ -272,17 +302,52 @@ def attributes(event: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def summarize(requests: list[dict[str, Any]], events: list[dict[str, Any]], makespan_ms: float) -> dict[str, Any]:
+def summarize(
+    requests: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    capacity_events: list[dict[str, Any]],
+    record_events: list[dict[str, Any]],
+    makespan_ms: float,
+) -> dict[str, Any]:
     successful = [row for row in requests if "error" not in row]
     attrs = [attributes(event) for event in events]
+    capacity_attrs = [attributes(event) for event in capacity_events]
+    record_attrs = [attributes(event) for event in record_events]
     statuses = [str(row.get("skippy.kv.status", "unknown")) for row in attrs]
+    capacity_observed = any("skippy.kv.capacity_status" in row for row in capacity_attrs)
+    capacity_statuses = [
+        str(row.get("skippy.kv.capacity_status", "legacy")) for row in capacity_attrs
+    ]
 
     def numeric(key: str) -> list[float]:
         return [float(row[key]) for row in attrs if isinstance(row.get(key), (int, float))]
 
+    def capacity_numeric(key: str) -> list[float]:
+        return [
+            float(row[key])
+            for row in capacity_attrs
+            if isinstance(row.get(key), (int, float))
+        ]
+
     ttft = [float(row["ttft_ms"]) for row in successful]
     matched = numeric("skippy.kv.matched_prefix_tokens")
     suffix = numeric("skippy.kv.suffix_prefill_tokens")
+    capacity_evicted_tokens = capacity_numeric("skippy.kv.capacity_evicted_tokens")
+    capacity_evicted_entries = capacity_numeric("skippy.kv.capacity_evicted_entries")
+    predicted_recompute_cost = capacity_numeric("skippy.kv.capacity_predicted_recompute_cost")
+    proactive = [
+        row for row in record_attrs if row.get("skippy.kv.decision") == "proactive_eviction"
+    ]
+    proactive_evicted_tokens = [
+        float(row["skippy.kv.proactive_evicted_tokens"])
+        for row in proactive
+        if isinstance(row.get("skippy.kv.proactive_evicted_tokens"), (int, float))
+    ]
+    proactive_evicted_entries = [
+        float(row["skippy.kv.proactive_evicted_entries"])
+        for row in proactive
+        if isinstance(row.get("skippy.kv.proactive_evicted_entries"), (int, float))
+    ]
     service_order = sorted(successful, key=lambda row: row["first_token_ms"])
     family_order = [str(row["family"]) for row in service_order]
     switches = sum(left != right for left, right in zip(family_order, family_order[1:]))
@@ -296,6 +361,14 @@ def summarize(requests: list[dict[str, Any]], events: list[dict[str, Any]], make
         "usage_cached_requests": sum(int(row.get("cached_tokens", 0)) > 0 for row in successful),
         "matched_prefix_tokens_total": sum(matched),
         "suffix_prefill_tokens_total": sum(suffix),
+        "capacity_rejections": capacity_statuses.count("rejected"),
+        "resident_evicted_tokens_total": sum(capacity_evicted_tokens)
+        + sum(proactive_evicted_tokens),
+        "resident_evicted_entries_total": sum(capacity_evicted_entries)
+        + sum(proactive_evicted_entries),
+        "predicted_recompute_cost_total": (
+            sum(predicted_recompute_cost) if capacity_observed else None
+        ),
         "ttft_ms_p50": percentile(ttft, 0.50),
         "ttft_ms_p95": percentile(ttft, 0.95),
         "makespan_ms": makespan_ms,
@@ -360,7 +433,38 @@ def run_cell(
         )
         try:
             harness.wait_ready(port, process, 900, path="/v1/models", server_name=version)
+            seed_result = None
+            if args.cache_seed is not None:
+                seed = args.cache_seed
+                seed_prompts = interleaved_prompts(
+                    int(seed["families"]), 1, int(seed["prefix_blocks"])
+                )
+                seed_event_start = len(radix.json_events(log_path, SUMMARY_EVENT))
+                seed_requests, seed_makespan_ms = run_requests(
+                    seed_prompts,
+                    case.model_id,
+                    int(seed["output_tokens"]),
+                    port,
+                    args.request_timeout_secs,
+                    float(seed["stagger_ms"]),
+                )
+                seed_successful = sum("error" not in row for row in seed_requests)
+                if seed_successful != len(seed_requests):
+                    errors = [row for row in seed_requests if "error" in row]
+                    raise RuntimeError(f"cache seed failed: {errors}")
+                radix.wait_for_json_events(
+                    log_path,
+                    SUMMARY_EVENT,
+                    seed_event_start + seed_successful,
+                    process,
+                )
+                seed_result = {
+                    "requests": seed_requests,
+                    "makespan_ms": seed_makespan_ms,
+                }
             event_start = len(radix.json_events(log_path, SUMMARY_EVENT))
+            capacity_event_start = len(radix.json_events(log_path, KV_CAPACITY_EVENT))
+            record_event_start = len(radix.json_events(log_path, KV_RECORD_EVENT))
             requests, makespan_ms = run_requests(
                 prompts,
                 case.model_id,
@@ -376,6 +480,10 @@ def run_cell(
                 event_start + expected,
                 process,
             )[event_start:]
+            capacity_events = radix.json_events(log_path, KV_CAPACITY_EVENT)[
+                capacity_event_start:
+            ]
+            record_events = radix.json_events(log_path, KV_RECORD_EVENT)[record_event_start:]
         finally:
             process.terminate()
             try:
@@ -389,8 +497,9 @@ def run_cell(
         "binary": str(binary),
         "config": str(config_path),
         "log": str(log_path),
+        "cache_seed": seed_result,
         "requests": requests,
-        "summary": summarize(requests, events, makespan_ms),
+        "summary": summarize(requests, events, capacity_events, record_events, makespan_ms),
     }
 
 
@@ -411,6 +520,12 @@ def aggregate(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "successful": sum(int(row["successful"]) for row in summaries),
                 "cache_hits_median": median("cache_hits"),
                 "suffix_prefill_tokens_median": median("suffix_prefill_tokens_total"),
+                "capacity_rejections": sum(
+                    int(row["capacity_rejections"]) for row in summaries
+                ),
+                "resident_evicted_tokens_median": median("resident_evicted_tokens_total"),
+                "resident_evicted_entries_median": median("resident_evicted_entries_total"),
+                "predicted_recompute_cost_median": median("predicted_recompute_cost_total"),
                 "ttft_ms_p50_median": median("ttft_ms_p50"),
                 "ttft_ms_p95_median": median("ttft_ms_p95"),
                 "makespan_ms_median": median("makespan_ms"),
@@ -439,19 +554,28 @@ def format_delta(old: float | None, new: float | None) -> str:
 
 
 def evaluate_acceptance(
-    rows: list[dict[str, Any]], profile: dict[str, Any] | None
+    rows: list[dict[str, Any]],
+    profile: dict[str, Any] | None,
+    contract_override: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if profile is None:
         return None
     indexed = {row["version"]: row for row in rows}
     old, new = indexed["old"], indexed["new"]
-    contract = profile["hardware_acceptance"]
+    contract = (
+        contract_override["hardware_acceptance"]
+        if contract_override is not None
+        else profile["hardware_acceptance"]
+    )
     checks: list[dict[str, Any]] = []
     known_contract_keys = {
         "successful_requests_per_binary",
         "absolute_user_metric_delta_percent_max",
         "suffix_prefill_before_min",
         "family_switch_before_min",
+        "capacity_rejections_after_max",
+        "resident_evicted_tokens_after_min",
+        "predicted_recompute_cost_after_min",
     }
     for prefix in (
         "suffix_prefill",
@@ -512,6 +636,27 @@ def evaluate_acceptance(
             "min",
             contract["family_switch_before_min"],
         )
+    if "capacity_rejections_after_max" in contract:
+        record(
+            "after capacity rejections",
+            new["capacity_rejections"],
+            "max",
+            contract["capacity_rejections_after_max"],
+        )
+    for contract_key, label, row_key in (
+        (
+            "resident_evicted_tokens_after_min",
+            "after resident KV evicted tokens per round",
+            "resident_evicted_tokens_median",
+        ),
+        (
+            "predicted_recompute_cost_after_min",
+            "after predicted recompute cost per round",
+            "predicted_recompute_cost_median",
+        ),
+    ):
+        if contract_key in contract:
+            record(label, new[row_key], "min", contract[contract_key])
     delta_keys = {
         "suffix_prefill": "suffix_prefill_tokens_median",
         "family_switch": "family_switches_median",
@@ -568,6 +713,22 @@ def report(rows: list[dict[str, Any]], acceptance: dict[str, Any] | None = None)
                 "",
             ]
         )
+    old_evicted = old["resident_evicted_tokens_median"]
+    new_evicted = new["resident_evicted_tokens_median"]
+    if old_evicted is not None and new_evicted is not None:
+        eviction_ceiling = max(old_evicted, new_evicted, 1)
+        lines.extend(
+            [
+                "```mermaid",
+                "xychart-beta",
+                '    title "Resident KV tokens evicted (lower is better)"',
+                '    x-axis ["Before", "After"]',
+                f'    y-axis "tokens" 0 --> {int(eviction_ceiling * 1.1)}',
+                f"    bar [{old_evicted:.0f}, {new_evicted:.0f}]",
+                "```",
+                "",
+            ]
+        )
     lines.extend(
         [
         "| Metric | Before | After | Delta |",
@@ -577,6 +738,10 @@ def report(rows: list[dict[str, Any]], acceptance: dict[str, Any] | None = None)
     metrics = (
         ("Cache hits / round", "cache_hits_median", False),
         ("Suffix prefill tokens / round", "suffix_prefill_tokens_median", True),
+        ("Capacity rejections", "capacity_rejections", True),
+        ("Resident KV evicted tokens / round", "resident_evicted_tokens_median", True),
+        ("Resident KV evicted entries / round", "resident_evicted_entries_median", True),
+        ("Predicted recompute cost / round", "predicted_recompute_cost_median", True),
         ("Family switches / round", "family_switches_median", True),
         ("TTFT p50 ms", "ttft_ms_p50_median", True),
         ("TTFT p95 ms", "ttft_ms_p95_median", True),
@@ -630,6 +795,11 @@ def main() -> int:
         type=Path,
         default=DEFAULT_FIXTURE_CATALOG,
     )
+    parser.add_argument(
+        "--acceptance-contract",
+        type=Path,
+        help="checked-in acceptance bounds for this layer over the selected workload",
+    )
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--families", type=int, default=2)
     parser.add_argument("--requests-per-family", type=int, default=6)
@@ -657,6 +827,28 @@ def main() -> int:
         fixture_profile, fixture_catalog_sha256 = apply_fixture_profile(args)
     except (json.JSONDecodeError, OSError, ValueError) as error:
         parser.error(f"invalid fixture profile: {error}")
+    acceptance_contract = None
+    acceptance_contract_sha256 = None
+    if args.acceptance_contract is not None:
+        try:
+            acceptance_contract_path = args.acceptance_contract.resolve()
+            acceptance_contract = load_acceptance_contract(acceptance_contract_path)
+            acceptance_contract_sha256 = sha256(acceptance_contract_path)
+        except (json.JSONDecodeError, OSError, ValueError) as error:
+            parser.error(f"invalid acceptance contract: {error}")
+        if args.fixture_profile is None:
+            parser.error("--acceptance-contract requires --fixture-profile")
+        if acceptance_contract["workload_profile"] != args.fixture_profile:
+            parser.error(
+                "acceptance contract workload_profile does not match --fixture-profile"
+            )
+        for key, value in acceptance_contract.get("workload_overrides", {}).items():
+            setattr(args, key, value)
+    args.cache_seed = (
+        acceptance_contract.get("cache_seed")
+        if acceptance_contract is not None
+        else None
+    )
     if min(args.rounds, args.families, args.requests_per_family, args.lanes, args.cache_entries) <= 0:
         parser.error("rounds, families, requests, lanes, and cache entries must be positive")
     if args.admission_concurrency < 0:
@@ -734,7 +926,7 @@ def main() -> int:
                 )
             )
     rows = aggregate(cells)
-    acceptance = evaluate_acceptance(rows, fixture_profile)
+    acceptance = evaluate_acceptance(rows, fixture_profile, acceptance_contract)
     result = {
         "metadata": {
             "old": {"commit": args.old_commit, "binary": str(binaries["old"]), "sha256": sha256(binaries["old"])},
@@ -759,11 +951,21 @@ def main() -> int:
                 str(args.fixture_catalog.resolve()) if fixture_profile is not None else None
             ),
             "fixture_catalog_sha256": fixture_catalog_sha256,
+            "acceptance_contract": (
+                str(args.acceptance_contract.resolve())
+                if acceptance_contract is not None
+                else None
+            ),
+            "acceptance_contract_name": (
+                acceptance_contract["name"] if acceptance_contract is not None else None
+            ),
+            "acceptance_contract_sha256": acceptance_contract_sha256,
             "output_tokens": args.output_tokens,
             "lanes": args.lanes,
             "admission_concurrency": args.admission_concurrency,
             "cache_entries": args.cache_entries,
             "stagger_ms": args.stagger_ms,
+            "cache_seed": args.cache_seed,
         },
         "cells": cells,
         "aggregate": rows,

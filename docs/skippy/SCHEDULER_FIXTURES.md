@@ -76,6 +76,7 @@ run the A/B harness with the named profile:
 ```bash
 python3 evals/skippy-waiting-prefix-ab.py \
   --fixture-profile agentic-eviction-pressure \
+  --acceptance-contract evals/skippy-capacity-acceptance.json \
   --prompt-manifest /tmp/skippy-agentic-eviction-pressure.json \
   --case-file /path/to/one-model-case.json \
   --old-bin /path/to/old/skippy-server \
@@ -93,7 +94,25 @@ HF profiles require their exact generated prompt manifest, while synthetic
 profiles reject external manifests. The result records the profile name and
 catalog SHA alongside binary, model, and prompt-manifest hashes.
 
-The eviction-pressure certificate requires every request to succeed and, at
+The same replay is also the capacity-policy certificate. Pass the checked-in
+`skippy-capacity-acceptance.json` contract when comparing the capacity layer;
+the measured agentic requests remain identical, but the gate changes from
+proving the DFS gain a second time to requiring actual eviction, zero
+fail-closed rejections, and no regression over 2% in recomputation, p95 TTFT,
+makespan, or throughput. The contract first
+seeds eight deterministic synthetic resident prefixes and raises the entry cap
+to sixteen, so the measured agentic requests encounter evictable cold state
+without reducing the validated per-lane context budget. The runner combines
+pre-admission and post-record resident eviction telemetry into per-round token
+and entry totals, reports fail-closed capacity rejections, and retains the
+planner's deterministic work estimate. Because the current per-token estimate
+is uniform within a stage, the certificate describes the effective victim
+policy as cold-first LRU rather than attributing results to cost density. This
+lets a stacked capacity change be compared against the preceding scheduler
+binary without changing the pinned requests or silently treating legacy
+proactive eviction as zero.
+
+The waiting-prefix eviction-pressure certificate requires every request to succeed and, at
 minimum, a 50,000-token suffix-prefill baseline and eight family switches so a
 drifted non-pressure workload cannot pass. It then requires 10% improvements
 in suffix prefill, family switches, p95 TTFT, and makespan plus 10% higher

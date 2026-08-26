@@ -34,6 +34,10 @@ def cell(version: str, ttft_ms: float | None) -> dict:
             "successful": int(ttft_ms is not None),
             "cache_hits": 0,
             "suffix_prefill_tokens_total": 0,
+            "capacity_rejections": 0,
+            "resident_evicted_tokens_total": 0,
+            "resident_evicted_entries_total": 0,
+            "predicted_recompute_cost_total": 0,
             "ttft_ms_p50": ttft_ms,
             "ttft_ms_p95": ttft_ms,
             "makespan_ms": 10,
@@ -44,6 +48,54 @@ def cell(version: str, ttft_ms: float | None) -> dict:
 
 
 class WaitingPrefixAbTest(unittest.TestCase):
+    def test_summary_combines_capacity_and_legacy_proactive_evictions(self) -> None:
+        requests = [
+            {
+                "request_id": 0,
+                "family": "one",
+                "first_token_ms": 5.0,
+                "ttft_ms": 5.0,
+                "tokens_predicted": 2,
+                "cached_tokens": 0,
+            }
+        ]
+        summary_events = [
+            {
+                "attributes": {
+                    "skippy.kv.status": "miss",
+                    "skippy.kv.suffix_prefill_tokens": 10,
+                }
+            }
+        ]
+        capacity_events = [
+            {
+                "attributes": {
+                    "skippy.kv.capacity_status": "evicted",
+                    "skippy.kv.capacity_evicted_tokens": 6,
+                    "skippy.kv.capacity_evicted_entries": 1,
+                    "skippy.kv.capacity_predicted_recompute_cost": 24,
+                }
+            }
+        ]
+        record_events = [
+            {
+                "attributes": {
+                    "skippy.kv.decision": "proactive_eviction",
+                    "skippy.kv.proactive_evicted_tokens": 4,
+                    "skippy.kv.proactive_evicted_entries": 1,
+                }
+            }
+        ]
+
+        summary = BENCH.summarize(
+            requests, summary_events, capacity_events, record_events, 10.0
+        )
+
+        self.assertEqual(summary["resident_evicted_tokens_total"], 10)
+        self.assertEqual(summary["resident_evicted_entries_total"], 2)
+        self.assertEqual(summary["predicted_recompute_cost_total"], 24)
+        self.assertEqual(summary["capacity_rejections"], 0)
+
     def test_warm_profile_accepts_the_measured_neutral_boundary(self) -> None:
         catalog = json.loads((REPO / "evals/skippy-scheduler-fixtures.json").read_text())
         profile = catalog["profiles"]["warm-affinity"]
@@ -137,6 +189,45 @@ class WaitingPrefixAbTest(unittest.TestCase):
             "output_tokens_per_second_median"
         ]
         self.assertFalse(BENCH.evaluate_acceptance(rows, profile)["passed"])
+
+    def test_capacity_contract_reuses_workload_with_layer_specific_bounds(self) -> None:
+        catalog = json.loads((REPO / "evals/skippy-scheduler-fixtures.json").read_text())
+        profile = catalog["profiles"]["agentic-eviction-pressure"]
+        contract = BENCH.load_acceptance_contract(
+            REPO / "evals/skippy-capacity-acceptance.json"
+        )
+        self.assertEqual(contract["workload_overrides"], {"cache_entries": 16})
+        self.assertEqual(contract["cache_seed"]["families"], 8)
+        rows = [
+            {
+                "version": "old",
+                "successful": 64,
+                "capacity_rejections": 0,
+                "resident_evicted_tokens_median": 2000.0,
+                "predicted_recompute_cost_median": None,
+                "suffix_prefill_tokens_median": 66735.5,
+                "family_switches_median": 10.0,
+                "ttft_ms_p95_median": 27901.1,
+                "makespan_ms_median": 30328.4,
+                "output_tokens_per_second_median": 16.26,
+            },
+            {
+                "version": "new",
+                "successful": 64,
+                "capacity_rejections": 0,
+                "resident_evicted_tokens_median": 1500.0,
+                "predicted_recompute_cost_median": 42000.0,
+                "suffix_prefill_tokens_median": 65000.0,
+                "family_switches_median": 10.0,
+                "ttft_ms_p95_median": 27500.0,
+                "makespan_ms_median": 30000.0,
+                "output_tokens_per_second_median": 16.5,
+            },
+        ]
+
+        self.assertTrue(BENCH.evaluate_acceptance(rows, profile, contract)["passed"])
+        rows[1]["capacity_rejections"] = 1
+        self.assertFalse(BENCH.evaluate_acceptance(rows, profile, contract)["passed"])
 
     def test_checked_in_fixture_profile_owns_the_workload_shape(self) -> None:
         args = Namespace(
