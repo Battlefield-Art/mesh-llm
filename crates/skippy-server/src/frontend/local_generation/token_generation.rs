@@ -511,22 +511,40 @@ impl StageOpenAiBackend {
     ) -> OpenAiResult<()> {
         let prefill_timer = PhaseTimer::start();
         let prefill_tokens =
-            request.prompt_token_ids[..request.prompt_token_ids.len() - 1].to_vec();
+            Arc::<[i32]>::from(&request.prompt_token_ids[..request.prompt_token_ids.len() - 1]);
         let recurrent_cache_prefix_token_ids = request
             .recurrent_cache_prefix_token_ids
             .map(<[i32]>::to_vec);
+        let (cache_affinity, refresh_cache_affinity) = match self.kv.as_ref() {
+            Some(kv) => {
+                let base = self.local_kv_message_base(session_id, request.ids);
+                let identities =
+                    kv.lookup_identities(&self.config, &base, 0, prefill_tokens.as_ref());
+                let affinity = kv.peek_cache_affinity(&self.config, &identities);
+                let kv = kv.clone();
+                let config = self.config.clone();
+                let refresh = Box::new(move || kv.peek_cache_affinity(&config, &identities))
+                    as Box<dyn Fn() -> skippy_scheduler::CacheAffinity + Send>;
+                (affinity, Some(refresh))
+            }
+            None => (skippy_scheduler::CacheAffinity::default(), None),
+        };
         let scheduler_backend = self.clone();
         let scheduler_session_id = session_id.to_string();
         let scheduler_ids = request.ids.clone();
         let mut scheduler_cache_stats = std::mem::take(cache_stats);
-        let outcome = self.iteration_scheduler.execute_runtime_timed(
+        let outcome = self.iteration_scheduler.execute_cache_aware_runtime_timed(
             "feature-kv-restore-prefill-record",
+            cache_affinity,
+            Arc::clone(&prefill_tokens),
+            0,
+            refresh_cache_affinity,
             move |runtime| {
                 let outcome = scheduler_backend.restore_or_record_kv_on_runtime(
                     runtime,
                     &scheduler_ids,
                     &scheduler_session_id,
-                    &prefill_tokens,
+                    prefill_tokens.as_ref(),
                     recurrent_cache_prefix_token_ids.as_deref(),
                     &mut scheduler_cache_stats,
                 )?;

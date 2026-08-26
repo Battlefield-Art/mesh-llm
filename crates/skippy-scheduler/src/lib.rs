@@ -4,11 +4,16 @@
 //! the same [`IterationPlan`], while `skippy-server` translates work items into
 //! native ABI requests.
 
+mod cache_policy;
 mod config;
 mod engine;
 mod sequence;
 mod telemetry;
 
+pub use cache_policy::{
+    CacheAffinity, CacheAwareCandidate, StageCacheAffinity, order_cache_aware_candidates,
+    select_cache_aware_candidate,
+};
 pub use config::{MemoryComponent, SchedulerConfig};
 pub use engine::{AdmissionError, Scheduler, SchedulerSnapshot};
 pub use sequence::{
