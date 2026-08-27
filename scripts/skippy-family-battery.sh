@@ -516,6 +516,7 @@ run_certify() {
     --cert-root "$cert_run_dir"
     --run-id certification
     --require-lanes
+    --wire-dtypes f16
     --strict-dtype
     --skip-build
   )
