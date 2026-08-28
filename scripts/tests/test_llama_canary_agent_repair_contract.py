@@ -71,6 +71,25 @@ class LlamaCanaryAgentRepairContractTests(unittest.TestCase):
             wrapper,
         )
 
+    def test_agent_turns_emit_heartbeat_progress(self) -> None:
+        wrapper = REPAIR.read_text(encoding="utf-8")
+        # Long agent turns must stay observable from the Actions log: a
+        # heartbeat monitor prints elapsed time and worktree activity every
+        # 10 minutes, runs without ambient credentials, and is killed as a
+        # whole process group when the turn ends. set -m (not setsid) makes
+        # the group portable to the macOS family-certify runner, and plain
+        # find -print (not -printf) is used for the same reason.
+        self.assertIn("heartbeat: agent turn running for", wrapper)
+        self.assertIn("while sleep 600", wrapper)
+        self.assertIn('env -i PATH="$PATH" bash -c', wrapper)
+        self.assertIn('heartbeat "$ROOT" "$started"', wrapper)
+        self.assertIn("set -m", wrapper)
+        self.assertNotIn("setsid", wrapper)
+        self.assertNotIn("-printf", wrapper)
+        self.assertIn('kill -- "-$heartbeat_pid"', wrapper)
+        self.assertIn('wait "$heartbeat_pid"', wrapper)
+        self.assertIn("recent worktree activity", wrapper)
+
     def test_every_github_call_is_token_scoped(self) -> None:
         wrapper = REPAIR.read_text(encoding="utf-8")
         # The workflow job exports no ambient GH_TOKEN and checks out with
@@ -102,6 +121,21 @@ class LlamaCanaryAgentRepairContractTests(unittest.TestCase):
         self.assertIn('if [[ "$MODE" == "patch-queue" ]]; then\n  rm -f "$BATTERY_LOG"', wrapper)
         # The repair push URL embeds the token; its stderr is redacted.
         self.assertIn("redact_token", wrapper)
+
+    def test_battery_build_mirrors_the_workflow_arch_guard(self) -> None:
+        wrapper = REPAIR.read_text(encoding="utf-8")
+        # The family-certify job runs under Rosetta; the wrapper's build must
+        # use the same arch -arm64 guard as the workflow's own build step,
+        # and refuse to certify a non-arm64 archive (run 33140672269 rebuilt
+        # x86_64 from a plain build-llama.sh call).
+        self.assertIn("arch -arm64 scripts/build-llama.sh -DCMAKE_OSX_ARCHITECTURES=arm64", wrapper)
+        self.assertIn("refusing to certify: native archive is not arm64", wrapper)
+
+    def test_push_failure_names_the_likely_permission_cause(self) -> None:
+        wrapper = REPAIR.read_text(encoding="utf-8")
+        # A 403 on the repair push is almost always a PAT-identity permission
+        # gap; the wrapper must say so instead of failing with a bare git error.
+        self.assertIn("identity behind CANARY_REPAIR_TOKEN lacks write access", wrapper)
 
     def test_dispatch_sha_is_validated_before_use(self) -> None:
         env = {

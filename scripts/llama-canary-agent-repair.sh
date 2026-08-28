@@ -129,10 +129,36 @@ fi
 agent_turn() {
   # Non-fatal: a crashed agent turn must not skip PR reporting. The model
   # runs without any GitHub token: push/PR/comment mutations are wrapper-only.
-  local prompt="$1"
+  # A heartbeat monitor prints elapsed time every 10 minutes so multi-hour
+  # repair turns show progress in the Actions log instead of looking stuck.
+  # It also reports the newest file modification under the llama.cpp worktree,
+  # so watchers can tell "agent is editing" from "turn is hung" without
+  # runner access.
+  local prompt="$1" started heartbeat_pid
+  started="$(date +%s)"
+  # Job control makes the heartbeat its own process group (portable on both
+  # the macOS family-certify runner and Linux CI); env -i keeps the monitor
+  # credential-free. GNU find's printf action and util-linux's session
+  # utility are not portable to macOS, hence the plain find and the
+  # set -m process group.
+  set -m
+  # shellcheck disable=SC2016  # heartbeat script takes its inputs as $1/$2
+  env -i PATH="$PATH" bash -c '
+    ROOT="$1"
+    started="$2"
+    while sleep 600; do
+      newest="$(find "$ROOT/.deps/llama.cpp" -type f -newer "$ROOT/.deps/llama-canary-target-sha" -print -quit 2>/dev/null || true)"
+      printf "heartbeat: agent turn running for %dm; recent worktree activity: %s\n" \
+        "$(( ($(date +%s) - started) / 60 ))" "${newest:-none observed yet}"
+    done
+  ' heartbeat "$ROOT" "$started" &
+  heartbeat_pid=$!
+  set +m
   env -u GH_TOKEN -u GITHUB_TOKEN -u CANARY_REPAIR_TOKEN \
     opencode run --model "$AGENT_MODEL" "$prompt" \
     || echo "warning: opencode turn exited non-zero" >&2
+  kill -- "-$heartbeat_pid" 2>/dev/null || kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
 }
 
 battery_summary() {
@@ -176,7 +202,14 @@ publish_repair_branch() {
       -m "Automated llama.cpp canary repair (mode: ${MODE}). Certified by the family battery on the family-certify runner."
   fi
   CERTIFIED_SHA="$(git rev-parse HEAD)"
-  git push "$(repair_remote)" "+HEAD:refs/heads/${BRANCH}" 2> >(redact_token >&2)
+  # Push failures are almost always a token-identity permission gap (seen
+  # live: 403 "denied to i386" because the PAT account lacked repo write).
+  # Surface a precise, actionable message instead of a bare git error, and
+  # never leak the token in the hint.
+  if ! git push "$(repair_remote)" "+HEAD:refs/heads/${BRANCH}" 2> >(redact_token >&2); then
+    echo "ERROR: could not push ${BRANCH}. If git reported 403/denied above, the identity behind CANARY_REPAIR_TOKEN lacks write access to ${GITHUB_REPOSITORY:?}: grant that account Contents+Pull requests write (or mint the PAT from an account that has it) and update the secret." >&2
+    return 1
+  fi
 }
 
 ensure_pr() {
@@ -293,8 +326,20 @@ apply_pr_body() {
 
 run_battery() {
   # Runs the certification battery; prints the summary line and returns the
-  # battery exit code. Log path is echoed for the caller.
-  scripts/build-llama.sh || return 1
+  # battery exit code. The build runs under `arch -arm64` mirroring the
+  # workflow's own build step: the family-certify job runs under Rosetta, and
+  # a plain build-llama.sh rebuild would reconfigure for x86_64, leaving
+  # arm64 Rust objects unable to link against x86_64 native archives (seen
+  # live in run 33140672269). An arm64 sanity check follows the build so a
+  # misconfigured toolchain fails loudly instead of as symbol errors.
+  arch -arm64 scripts/build-llama.sh -DCMAKE_OSX_ARCHITECTURES=arm64 || return 1
+  local archive
+  archive="${LLAMA_STAGE_BUILD_DIR:-}/src/libllama.a"
+  if [[ -n "${LLAMA_STAGE_BUILD_DIR:-}" && -f "$archive" ]] \
+     && [[ "$(lipo -archs "$archive" 2>/dev/null)" != "arm64" ]]; then
+    echo "refusing to certify: native archive is not arm64: $(lipo -archs "$archive" 2>/dev/null)" >&2
+    return 1
+  fi
   if scripts/skippy-family-battery.sh >"$BATTERY_LOG" 2>&1; then
     tail -n 2 "$BATTERY_LOG"
     return 0
