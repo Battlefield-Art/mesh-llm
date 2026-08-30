@@ -1589,7 +1589,7 @@
   ],
   "crates/mesh-llm-host-runtime/src/inference/skippy/resolver/native_mtp_tests.rs": [
     {
-      "line": 898,
+      "line": 914,
       "macro_name": "eprintln!"
     }
   ],
@@ -1885,19 +1885,19 @@
   ],
   "crates/mesh-llm-host-runtime/src/runtime/local_split/tests.rs": [
     {
-      "line": 1602,
+      "line": 1657,
       "macro_name": "eprintln!"
     },
     {
-      "line": 1607,
+      "line": 1662,
       "macro_name": "eprintln!"
     },
     {
-      "line": 1620,
+      "line": 1675,
       "macro_name": "eprintln!"
     },
     {
-      "line": 1642,
+      "line": 1697,
       "macro_name": "eprintln!"
     }
   ],
