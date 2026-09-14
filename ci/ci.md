@@ -375,7 +375,9 @@ runtime producers are not duplicated.
   (`scripts/ci-runtime-events-native-gate.sh`) against the runtime it just
   built and the `family-qwen3-dense` fixture from `skippy-ci-smoke.json`,
   authorized for pull-request, main, and manual cadences, and uploads its
-  evidence file. Model cadence authorization lives in the checked-out registry,
+  evidence file. It resolves that evidence file to an absolute path before
+  Cargo starts, so the crate-local test writer and the lane check read the same
+  file. Model cadence authorization lives in the checked-out registry,
   so PRs using the protected main workflow consume the same fix. The separate
   family-certification cadence remains unchanged. That gate is
   env-gated so an ordinary `cargo test` never touches a native symbol, which

@@ -579,7 +579,10 @@ fail-open policy.
   `scripts/generate-test-model-manifests.py` owns the family battery and
   suite-specific projections; CI contract tests reject stale projections.
 - The Linux CPU runtime-event gate consumes `family-qwen3-dense` from
-  `skippy-ci-smoke.json` at pull-request, main, or manual cadence.
+  `skippy-ci-smoke.json` at pull-request, main, or manual cadence. Its
+  family-certification cadences remain unchanged. The gate resolves its
+  evidence output to an absolute path before Cargo starts, so the crate-local
+  test writer and lane check use the same file.
 - `restore-test-model`: the single implementation of model resolve, cache,
   download, and verify. Resolves generated suite manifests, uses exact
   digest-bearing cache keys, and stream-verifies size and SHA-256 before use.
