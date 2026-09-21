@@ -32,6 +32,11 @@ pub struct RuntimeOptions {
     pub mesh_guardrails: MeshGuardrailMode,
     pub help_text: Option<String>,
     pub join: Vec<String>,
+    /// Invite-token files from `--join-file` / `MESH_LLM_JOIN_FILE`.
+    ///
+    /// Re-read on every rejoin attempt so a rotated token is picked up without
+    /// restarting a service.
+    pub join_files: Vec<PathBuf>,
     pub discover: Option<String>,
     pub auto: bool,
     pub mesh_discovery_mode: MeshDiscoveryMode,
@@ -113,6 +118,7 @@ impl Default for RuntimeOptions {
             mesh_guardrails: MeshGuardrailMode::Disabled,
             help_text: None,
             join: Vec::new(),
+            join_files: Vec::new(),
             discover: None,
             auto: false,
             mesh_discovery_mode: MeshDiscoveryMode::Nostr,
@@ -188,6 +194,23 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// Every invite token this process should try right now: the `join` /
+    /// `MESH_LLM_JOIN` literals plus the current contents of every file-backed
+    /// source.
+    ///
+    /// `self.join` deliberately holds literals only (see `join_sources`), so a
+    /// consumer asking "does this process have a configured invite token?"
+    /// must ask here rather than testing `self.join`; a token that lives only
+    /// in a file is still a configured token.
+    pub(crate) fn effective_join_tokens(&self) -> Vec<String> {
+        super::join_sources::resolve_invite_tokens(
+            &self.join,
+            &self.join_files,
+            self.config.as_deref(),
+        )
+        .tokens
+    }
+
     pub fn validate_discovery_mode_args(&self) -> anyhow::Result<()> {
         if self.mesh_discovery_mode != MeshDiscoveryMode::Mdns {
             return Ok(());
