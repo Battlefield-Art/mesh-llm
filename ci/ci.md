@@ -71,6 +71,11 @@ reports before readiness or artifact publication. Publication fixtures execute
 the real dependency projection against complete workspace metadata; fake Cargo
 is confined to metadata acquisition and publish transport.
 
+SDK fixture failures report the install, daemon and consumer process outcomes,
+exit statuses and cleanup facts separately. Diagnostics omit child output and
+rejection text from the summary so invite credentials remain private. A passing
+consumer does not waive daemon shutdown failure or forced cleanup.
+
 For isolated Unix whole-wrapper diagnostics, `automation sdk-compat run` owns
 execution of the current `scripts/ci-compat-smoke.sh`. Its named inputs include
 the exact product binary, runtime directory and model, the literal absolute SDK
@@ -243,8 +248,16 @@ multimodal library-test executable, and the run-scoped CPU workload oracle
 closure. Static Metal resources are embedded; an unpackaged non-system dylib
 makes the handoff fail. SHA-256 digests bind all handoff bytes to the candidate,
 main base, run/attempt, and pass identity.
+The native generator gives each whole-source rewriter pass a 600-second
+deadline, separate from the 60-second Git command default. An explicit
+`--timeout` overrides both. Generation and idempotence each remain required;
+deadline failures report readable retained output and process cleanup status.
+
 The build job sets `CTEST_PARALLEL_LEVEL=16` for complete upstream CTest runs
 in the repair session and trusted build; the per-case timeout remains 900 seconds.
+Non-chat certification uses ordinary `skippy serve --model-path` startup and
+binds oracle evidence to the same candidate `skippy` executable. It does not
+generate a stage configuration or supply cache-admission labels.
 
 Before compilation, the controller runs the selected battery in cache-free
 `--dry-run --skip-build` mode against its own planner output. This checks the
@@ -1696,7 +1709,7 @@ unchanged, including historical `mesh_ref` certification. Missing artifact sizes
 and peaks beyond the larger tier fail planning. No family is silently skipped.
 An optional source-owned `minimum_runner_memory_gib` value of 128 or 256 may
 promote an estimate-selected row but cannot demote it; plans without the field
-remain estimate-only. GLM-4.5-Air, Qwen4exp and Llama4 currently require the
+remain estimate-only. GLM-4.5-Air, Qwen4exp, Llama4 and MiniMax-M2 currently require the
 256-plus tier through this policy.
 
 The Rust canary source-plan placement owner uses the greater of pinned file sizes and
@@ -1957,3 +1970,10 @@ The unused local `audit-depot-pr-isolation` implementation is removed. All 27
 protected callers still use their immutable published `ed07043` action, and the
 five published package resolvers retain their separate rollout boundary. Neither
 SDK extraction nor native trajectory input changes those authority checks.
+
+Standalone OpenAI, cache-reuse, and System One serving smokes launch `skippy serve`
+with `--model-path` and public resource settings. They do not synthesize stage
+configuration or prescribe attention/recurrent cache representations. Loaded
+native graphs and memory exporters own cache admission. Split correctness still
+uses genuine planner output and binary stage servers. Cache-hit assertions run
+on immediate repeated requests without publication sleeps or retries.

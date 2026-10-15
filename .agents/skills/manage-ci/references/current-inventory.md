@@ -198,10 +198,19 @@ closure built by `just skippy-workload-oracles-build`. Static Metal resources
 are embedded; an unpackaged non-system dylib makes the handoff fail. SHA-256
 digests bind all handoff bytes to the candidate, main base, run/attempt, and
 pass identity.
+The native generator defaults to 600 seconds per whole-source rewriter pass,
+independently of its 60-second Git command budget. `--timeout` overrides both.
+Both generation and idempotence remain required; deadline diagnostics retain
+readable child output and process cleanup status.
+
 The build job sets `CTEST_PARALLEL_LEVEL=16` for complete upstream CTest runs
 in the repair session and trusted build; the per-case timeout remains 900 seconds.
 The build job prepares the locked canary Python SDK before its early Metal
 battery, so Nomic embedding uses the same interpreter as family workers.
+Non-chat certification starts the candidate through `skippy serve --model-path`
+and verifies oracle evidence against that same `skippy` executable. Its native
+fixture distinguishes API workload classes from causal decoder execution;
+OCR and speech frontends may legitimately warm a decoder.
 Goose's build and test commands use `scripts/llama-canary-log-command.sh` to
 stream output and retain separate invocation logs, exit statuses, and available
 CTest result files under the build job's 14-day repair evidence artifact.
@@ -502,6 +511,11 @@ shutdown fail admission. Private state deletion allows five attempts separated
 by one-second waits; persistent locks fail cleanup and retain remaining state.
 Native tests cover bounded deletion and actual Windows handle locks; the latter
 require a Windows test host and are separate from local macOS validation.
+
+The shared SDK fixture reports installation, daemon and consumer exit and
+cleanup facts on session failure, without including captured output or rejection
+text in that summary. Its executable contracts distinguish consumer failure,
+nonzero daemon shutdown and forced daemon cleanup; all remain failed smokes.
 
 All workflow calls use typed, bounded semantic inputs. Credential-bearing smoke
 workflows remain fixed to GitHub-hosted runners; the PR entrypoints pass no
@@ -1443,7 +1457,7 @@ unchanged, including historical `mesh_ref` certification. Missing artifact sizes
 and peaks beyond the larger tier fail planning. No family is silently skipped.
 An optional source-owned `minimum_runner_memory_gib` value of 128 or 256 may
 promote an estimate-selected row but cannot demote it; plans without the field
-remain estimate-only. GLM-4.5-Air, Qwen4exp and Llama4 currently require the
+remain estimate-only. GLM-4.5-Air, Qwen4exp, Llama4 and MiniMax-M2 currently require the
 256-plus tier through this policy.
 
 The Rust canary source-plan placement owner uses the greater of pinned file sizes and
@@ -1714,3 +1728,9 @@ The unused local `audit-depot-pr-isolation` implementation is removed. All 27
 protected callers still use their immutable published `ed07043` action, and the
 five published package resolvers retain their separate rollout boundary. Neither
 SDK extraction nor native trajectory input changes those authority checks.
+
+Standalone OpenAI, cache-reuse, and System One smokes now use `skippy serve
+--model-path` directly. The handmade `openai-smoke-config` command and System One
+stage serializer are removed. The server derives cache capabilities from its
+loaded native graph and memory; tests supply only public resource/cache budgets.
+Split parity continues to use native planner evidence and binary stage servers.
