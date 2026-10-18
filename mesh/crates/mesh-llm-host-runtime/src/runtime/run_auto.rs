@@ -311,19 +311,10 @@ pub(super) async fn run_runtime_cli(
     })
     .await?;
 
-    // Finish the release check before startup continues.
-    if !checked_updates
-        && !options.command_is_update
-        && !options.command_uses_machine_output
-        && let Some(notice) = autoupdate::check_for_update(crate::BUILD_VERSION).await
-    {
-        let _ = emit_event(OutputEvent::Info {
-            message: notice.message,
-            context: None,
-        });
-    }
-
     let mut config = plugin::load_config(options.config.as_deref())?;
+
+    super::startup_update_check::announce_newer_release(&options, checked_updates, &config).await;
+
     let effective_mode = resolve_effective_mode(&options, config.runtime.mode);
     if let Err(error) = check_mode_conflicts(&options, explicit_surface, config.runtime.mode) {
         anyhow::bail!("mode conflict: {error}");
@@ -1865,6 +1856,7 @@ async fn run_auto_inner(
         affinity_router: &affinity_router,
         control_tx: &control_tx,
         owner_key_path: &runtime_owner_key_path,
+        update_check: config.updates.check_enabled(),
     })
     .await?;
     publish_initial_openai_guardrails_status(
