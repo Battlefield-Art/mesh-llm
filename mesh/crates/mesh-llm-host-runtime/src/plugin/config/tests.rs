@@ -33,6 +33,7 @@ fn config_override_env_names_owner_totality_is_unchanged() {
             "MESH_LLM_CONFIG",
             "MESH_LLM_LIFECYCLE_LOG_PARSER",
             "MESH_LLM_NO_UPDATE_CHECK",
+            "MESH_LLM_NO_RUNTIME_DOWNLOAD",
             "MESH_LLM_BENCHMARK_TUNE_TRIAL",
             "MESH_LLM_EVENT_SYSTEM_TRIAL_MODE"
         ]
@@ -206,6 +207,75 @@ fn load_config_through_production_wrapper_rejects_invalid_no_update_check_env_ov
     let err = load_config(Some(&config_path))
         .expect_err("an invalid MESH_LLM_NO_UPDATE_CHECK value must fail, never be defaulted");
     assert!(format!("{err:#}").contains("MESH_LLM_NO_UPDATE_CHECK"));
+}
+
+#[test]
+fn load_config_through_production_wrapper_applies_no_runtime_download_env_override() {
+    if !env_override_in_child_for_test(
+        concat!(
+            module_path!(),
+            "::load_config_through_production_wrapper_applies_no_runtime_download_env_override"
+        ),
+        "MESH_LLM_NO_RUNTIME_DOWNLOAD",
+        "0",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "version = 1\n\n[runtime.native_runtime]\ndownload = false\n",
+    )
+    .unwrap();
+
+    let config =
+        load_config(Some(&config_path)).expect("config should load through the production wrapper");
+    assert!(
+        config.runtime.native_runtime.download_enabled(),
+        "MESH_LLM_NO_RUNTIME_DOWNLOAD=0 must override runtime.native_runtime.download = false"
+    );
+}
+
+#[test]
+fn load_config_through_production_wrapper_applies_no_runtime_download_env_override_without_a_file()
+{
+    if !env_override_in_child_for_test(
+        concat!(
+            module_path!(),
+            "::load_config_through_production_wrapper_applies_no_runtime_download_env_override_without_a_file"
+        ),
+        "MESH_LLM_NO_RUNTIME_DOWNLOAD",
+        "1",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+
+    let config = load_config(Some(&temp.path().join("does-not-exist.toml")))
+        .expect("a default config must still honor the env override");
+    assert!(!config.runtime.native_runtime.download_enabled());
+}
+
+#[test]
+fn load_config_through_production_wrapper_rejects_invalid_no_runtime_download_env_override() {
+    if !env_override_in_child_for_test(
+        concat!(
+            module_path!(),
+            "::load_config_through_production_wrapper_rejects_invalid_no_runtime_download_env_override"
+        ),
+        "MESH_LLM_NO_RUNTIME_DOWNLOAD",
+        "yes",
+    ) {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "version = 1\n").unwrap();
+
+    let err = load_config(Some(&config_path))
+        .expect_err("an invalid MESH_LLM_NO_RUNTIME_DOWNLOAD value must fail, never be defaulted");
+    assert!(format!("{err:#}").contains("MESH_LLM_NO_RUNTIME_DOWNLOAD"));
 }
 
 fn documented_matrix_key_paths() -> BTreeSet<String> {
